@@ -109,7 +109,9 @@ DEFAULT_CONFIG = {
     "scan_tickers": [],           # empty = a built-in list of about 70 large, liquid US stocks
     "scan_rsi_dip": 35,           # RSI must have dropped to this level or lower in the last 4 days
     "scan_cooldown_days": 10,     # don't alert the same stock again within this many days
-    "scan_max_alerts": 5,         # at most this many dip alerts per day (best first)
+    "scan_max_alerts": 8,         # at most this many buy ideas per day from the scanner (best first)
+    "scan_bots": ["dip", "breakout", "trend", "gap"],  # which scanner bots are on (you can also switch them in the chat)
+    "exit_signals": True,         # also send sell signals when a trade looks overbought or its short-term trend breaks
     "scan_min_dollar_volume": 20000000,  # skip stocks trading less than this many dollars per day
 }
 
@@ -138,7 +140,10 @@ def load_config(strict: bool = True) -> dict:
         val = os.environ.get("IA_" + key.upper())
         if val:
             try:
-                cfg[key] = val if isinstance(default, str) else json.loads(val)
+                if key == "scan_bots" and not val.lstrip().startswith("["):   # SCAN_BOTS=dip,breakout also works
+                    cfg[key] = [x.strip().lower() for x in val.split(",") if x.strip()]
+                else:
+                    cfg[key] = val if isinstance(default, str) else json.loads(val)
             except ValueError:
                 sys.exit(f"Bad value for IA_{key.upper()}: {val!r}")
     ua = cfg["sec_user_agent"]
@@ -465,6 +470,8 @@ def init_db() -> sqlite3.Connection:
         manual INTEGER DEFAULT 0, status TEXT DEFAULT 'open',
         sell_alerted INTEGER DEFAULT 0, news_warned INTEGER DEFAULT 0,
         exit_price REAL, exit_at TEXT, exit_reason TEXT, pnl REAL, ret REAL)""")
+    if "bot" not in [r[1] for r in db.execute("PRAGMA table_info(positions)")]:
+        db.execute("ALTER TABLE positions ADD COLUMN bot TEXT DEFAULT ''")
     db.commit()
     return db
 
@@ -484,12 +491,13 @@ def held_days(pos: dict) -> int:
     return (utc_now() - datetime.fromisoformat(pos["entry_at"])).days
 
 
-def open_tracked_position(db: sqlite3.Connection, parsed: dict, entry: float, cfg: dict) -> int:
-    """Simulated trade opened when a buy alert fires. Returns the share count."""
+def open_tracked_position(db: sqlite3.Connection, parsed: dict, entry: float, cfg: dict, bot: str = "insider") -> int:
+    """Simulated trade opened when a buy alert fires. Returns the share count.
+    `bot` says which bot(s) found it, e.g. "insider" or "dip+breakout"."""
     shares = max(1, int(cfg["position_usd"] // entry))
-    db.execute("INSERT INTO positions (ticker, company, shares, entry_price, entry_at, peak, last_price, manual) "
-               "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-               (parsed["ticker"], parsed["company"], shares, entry, now_iso(), entry, entry))
+    db.execute("INSERT INTO positions (ticker, company, shares, entry_price, entry_at, peak, last_price, manual, bot) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+               (parsed["ticker"], parsed["company"], shares, entry, now_iso(), entry, entry, bot))
     db.commit()
     return shares
 
@@ -864,10 +872,173 @@ def evaluate_dip(bars: list[dict], cfg: dict) -> dict | None:
         why.append("holding near its 50-day average")
     if vol_up:
         why.append(f"bounce on higher volume ({vols[-1] / avg_vol:.1f}x the 20-day average)")
-    return {"date": bars[-1]["date"], "close": c, "rsi_low": low_rsi, "rsi_now": r_now,
+    return {"bot": "dip", "date": bars[-1]["date"], "close": c, "rsi_low": low_rsi, "rsi_now": r_now,
             "vs50": c / s50 - 1, "vs200": c / s200 - 1, "pullback": c / max(closes[-10:]) - 1,
             "atr": atr_pct(bars), "score": score, "why": why,
             "level": "STRONG" if score >= 3 else "MODERATE" if score == 2 else "WEAK"}
+
+
+# --------------------------------------------------------------------------- #
+# More scanner bots. Every buy bot needs the same safety checks first:
+# a long-term uptrend and a stock that is easy to trade. The scan also pauses
+# all of them when the overall market is weak.
+# --------------------------------------------------------------------------- #
+def uptrend_ok(bars: list[dict], cfg: dict) -> bool:
+    if len(bars) < 221:
+        return False
+    closes, vols = [b["close"] for b in bars], [b["volume"] for b in bars]
+    s50, s200 = sum(closes[-50:]) / 50, sum(closes[-200:]) / 200
+    s200_old = sum(closes[-220:-20]) / 200
+    if not (closes[-1] > s200 and s50 > s200 and s200 > s200_old):
+        return False
+    return sum(closes[i] * vols[i] for i in range(-20, 0)) / 20 >= cfg["scan_min_dollar_volume"]
+
+
+def _level(score: int) -> str:
+    return "STRONG" if score >= 3 else "MODERATE" if score == 2 else "WEAK"
+
+
+def evaluate_breakout(bars: list[dict], cfg: dict) -> dict | None:
+    """A new 3-month closing high on heavy volume, in an uptrend, not already stretched."""
+    if not uptrend_ok(bars, cfg):
+        return None
+    closes, vols = [b["close"] for b in bars], [b["volume"] for b in bars]
+    b, c = bars[-1], closes[-1]
+    avg_vol = sum(vols[-21:-1]) / 20
+    if c <= max(closes[-64:-1]):                                    # 1) a new 3-month closing high
+        return None
+    if not (avg_vol > 0 and vols[-1] >= 1.5 * avg_vol):             # 2) real buying interest
+        return None
+    s50 = sum(closes[-50:]) / 50
+    if c > 1.15 * s50:                                              # 3) not already stretched far above its trend
+        return None
+    r = rsi_series(closes)[-1]
+    if r is None or r >= 80:                                        # 4) not overheated
+        return None
+    if b["high"] > b["low"] and c < b["low"] + 0.5 * (b["high"] - b["low"]):
+        return None                                                  # 5) closed in the top half of the day
+    year_high = c >= max(closes[-252:])
+    heavy = vols[-1] >= 2 * avg_vol
+    base = (max(closes[-21:-1]) - min(closes[-21:-1])) / c < 0.08
+    score = year_high + heavy + base
+    why = ["long-term uptrend (above rising 200-day average)",
+           f"closed at a new 3-month high on {vols[-1] / avg_vol:.1f}x its usual volume"]
+    if year_high:
+        why.append("also a new 1-year high")
+    if base:
+        why.append("it moved sideways for a month first, then broke out")
+    return {"bot": "breakout", "date": b["date"], "close": c, "rsi_now": r, "vs50": c / s50 - 1,
+            "atr": atr_pct(bars), "score": score, "why": why, "level": _level(score)}
+
+
+def evaluate_trend(bars: list[dict], cfg: dict) -> dict | None:
+    """The 20-day average crossed above the 50-day within the last 3 days, in a long-term uptrend."""
+    if not uptrend_ok(bars, cfg):
+        return None
+    closes, vols = [b["close"] for b in bars], [b["volume"] for b in bars]
+    c = closes[-1]
+    def avg(n: int, back: int) -> float:
+        end = len(closes) - back
+        return sum(closes[end - n:end]) / n
+    crossed = any(avg(20, k) > avg(50, k) and avg(20, k + 1) <= avg(50, k + 1) for k in range(3))
+    if not crossed or avg(20, 0) <= avg(50, 0) or c <= avg(20, 0):
+        return None
+    r = rsi_series(closes)[-1]
+    if r is None or not (50 <= r <= 70):                            # momentum is up, but not overheated
+        return None
+    avg_vol = sum(vols[-21:-1]) / 20
+    near_high = c >= 0.95 * max(closes[-63:])
+    vol_up = avg_vol > 0 and vols[-1] > avg_vol
+    mid = 55 <= r <= 68
+    score = near_high + vol_up + mid
+    why = ["long-term uptrend (above rising 200-day average)",
+           "its 20-day average just moved above its 50-day average, a sign the short-term trend turned up"]
+    if near_high:
+        why.append("price is within 5% of its 3-month high")
+    if vol_up:
+        why.append("on above-average volume")
+    return {"bot": "trend", "date": bars[-1]["date"], "close": c, "rsi_now": r,
+            "vs50": c / avg(50, 0) - 1, "atr": atr_pct(bars), "score": score, "why": why, "level": _level(score)}
+
+
+def evaluate_gap(bars: list[dict], cfg: dict) -> dict | None:
+    """Jumped 4%+ at the open on heavy volume (often earnings or big news) and held the gain all day."""
+    if len(bars) < 221:
+        return None
+    closes, vols = [b["close"] for b in bars], [b["volume"] for b in bars]
+    b, c, prev = bars[-1], closes[-1], closes[-2]
+    s200 = sum(closes[-200:]) / 200
+    if c <= s200 or sum(closes[i] * vols[i] for i in range(-20, 0)) / 20 < cfg["scan_min_dollar_volume"]:
+        return None
+    gap = b["open"] / prev - 1
+    if gap < 0.04 or c < b["open"] or c < prev * 1.03:               # a real gap that did not fade
+        return None
+    avg_vol = sum(vols[-21:-1]) / 20
+    if not (avg_vol > 0 and vols[-1] >= 2 * avg_vol):
+        return None
+    s50 = sum(closes[-50:]) / 50
+    if c > 1.25 * s50:                                               # already far above its trend
+        return None
+    big = gap >= 0.06
+    huge_vol = vols[-1] >= 3 * avg_vol
+    strong_close = b["high"] > b["low"] and c >= b["low"] + 0.75 * (b["high"] - b["low"])
+    score = big + huge_vol + strong_close
+    why = [f"gapped up {gap:.1%} at the open and closed {c / prev - 1:+.1%} on the day, holding the gain",
+           f"on {vols[-1] / avg_vol:.1f}x its usual volume (often earnings or big news)",
+           "still above its 200-day average"]
+    return {"bot": "gap", "date": b["date"], "close": c, "gap": gap, "vs50": c / s50 - 1,
+            "atr": atr_pct(bars), "score": score, "why": why, "level": _level(score)}
+
+
+# id -> (evaluate function, name shown in the app, word used in the alert title, one-line description)
+BOTS = {
+    "dip": (evaluate_dip, "Dip Bot", "dip-buy", "Strong stocks that pulled back and have started to bounce."),
+    "breakout": (evaluate_breakout, "Breakout Bot", "breakout", "Stocks closing at a new 3-month high on heavy volume."),
+    "trend": (evaluate_trend, "Trend Bot", "trend", "Stocks whose 20-day average just crossed above the 50-day."),
+    "gap": (evaluate_gap, "Gap Bot", "gap-up", "Stocks that jump 4% or more on heavy volume and hold it, often after earnings."),
+}
+
+
+def enabled_bots(cfg: dict, db: sqlite3.Connection | None = None) -> list[str]:
+    off = set()
+    if db is not None:
+        try:
+            off = set(json.loads(meta_get(db, "bots_off", "[]")))
+        except ValueError:
+            pass
+    return [b for b in BOTS if b in [x.lower() for x in cfg["scan_bots"]] and b not in off]
+
+
+def trade_line(cfg: dict) -> str:
+    return (f"Sell rules: stop-loss -{cfg['stop_loss_pct']:.0%}, profit target +{cfg['take_profit_pct']:.0%}, "
+            f"trailing stop {cfg['trailing_stop_pct']:.0%} from the peak, max {cfg['max_hold_days']} days"
+            + (", or earlier if it looks overbought or its short-term trend breaks." if cfg.get("exit_signals") else "."))
+
+
+def format_bot_alert(ticker: str, hits: list, cfg: dict) -> str:
+    """hits: [(bot_id, setup)]. One hit gets its own wording; two or more become one stronger alert."""
+    icon = {"STRONG": "🟢", "MODERATE": "🟡", "WEAK": "⚪"}
+    if len(hits) == 1:
+        bot, e = hits[0]
+        if bot == "dip":
+            return format_dip_alert(ticker, e, cfg)
+        head = f"{icon[e['level']]} {e['level']} {BOTS[bot][2]} idea: {ticker}"
+        why = e["why"]
+    else:
+        names = " and ".join(BOTS[b][1] for b, _ in hits)
+        e = hits[0][1]
+        head = f"🟢 STRONG idea confirmed by {len(hits)} bots: {ticker}"
+        why = [f"{BOTS[b][1]}: {'; '.join(x['why'][1:] or x['why'])}" for b, x in hits]
+        head_note = f"Found by {names}. When more than one bot agrees, I treat it as stronger."
+    lines = [head, f"Price ${e['close']:,.2f} (close of {e['date']})"
+             + (f" | typical daily move ±{e['atr']:.1%}" if e.get("atr") else "")]
+    if len(hits) > 1:
+        lines.append(head_note)
+    lines += [("Why: " + "; ".join(why)) if len(hits) == 1 else ("Why:\n  " + "\n  ".join(why)),
+              trade_line(cfg),
+              "Check the company's next earnings date first: a report can move the price sharply either way. "
+              "Not financial advice."]
+    return "\n".join(lines)
 
 
 def format_dip_alert(ticker: str, e: dict, cfg: dict) -> str:
@@ -878,15 +1049,22 @@ def format_dip_alert(ticker: str, e: dict, cfg: dict) -> str:
              f"Trend: {e['vs50']:+.1%} vs 50-day average, {e['vs200']:+.1%} vs 200-day average"
              + (f" | typical daily move ±{e['atr']:.1%}" if e["atr"] else ""),
              "Why: " + "; ".join(e["why"]),
-             f"Sell rules: stop-loss -{cfg['stop_loss_pct']:.0%}, profit target +{cfg['take_profit_pct']:.0%}, "
-             f"trailing stop {cfg['trailing_stop_pct']:.0%} from the peak, max {cfg['max_hold_days']} days.",
+             trade_line(cfg),
              "Check the company's next earnings date first: a report can move the price sharply either way. "
              "A dip can keep falling. Not financial advice."]
     return "\n".join(lines)
 
 
+def market_info(spy: list[dict]) -> dict:
+    closes = [b["close"] for b in spy]
+    s200 = sum(closes[-200:]) / 200
+    return {"state": "up" if closes[-1] > s200 else "down", "spy": round(closes[-1], 2), "vs200": round(closes[-1] / s200 - 1, 4),
+            "chg20": round(closes[-1] / closes[-21] - 1, 4) if len(closes) > 21 else 0.0,
+            "swing": round(atr_pct(spy) or 0.0, 4), "bar": spy[-1]["date"]}
+
+
 def run_scan(cfg: dict, db: sqlite3.Connection, notify, force: bool = False) -> int | None:
-    """Scan once. Returns the number of alerts, or None if today's prices are not published yet."""
+    """Scan once with every bot that is on. Returns the number of alerts, or None if today's prices are not published yet."""
     spy = fetch_history("SPY")  # raises if no price data is reachable
     bar_date = spy[-1]["date"]
     if not force:
@@ -895,20 +1073,23 @@ def run_scan(cfg: dict, db: sqlite3.Connection, notify, force: bool = False) -> 
             return None
         if (utc_now().date() - datetime.fromisoformat(bar_date).date()).days > 5:
             raise RuntimeError(f"price data looks stale (latest bar {bar_date})")
-    healthy = market_is_healthy(spy)
-    state, prev = ("up" if healthy else "down"), meta_get(db, "market_state")
+    info = market_info(spy)
+    healthy = info["state"] == "up"
+    meta_set(db, "market_info", json.dumps(info))
+    state, prev = info["state"], meta_get(db, "market_state")
     if state != prev:
         meta_set(db, "market_state", state)
         if not healthy:
             notify("📉 The overall market (S&P 500) is below its 200-day average, a weak phase. "
-                   "I'm pausing dip-buy alerts until it recovers. Insider alerts keep running.")
+                   "I'm pausing all buy ideas until it recovers. Insider alerts and sell signals keep running.")
         elif prev == "down":
-            notify("📈 The overall market is back above its 200-day average. Dip-buy alerts are on again.")
+            notify("📈 The overall market is back above its 200-day average. Buy ideas are on again.")
     meta_set(db, "scan_bar", bar_date)
     if not healthy:
-        log("scan: market below its 200-day average, no dip alerts")
+        log("scan: market below its 200-day average, no buy ideas")
         return 0
 
+    bots = enabled_bots(cfg, db)
     held = {p["ticker"] for p in open_positions(db)}
     hits, failed = [], 0
     tickers = [t.upper() for t in (cfg["scan_tickers"] or DEFAULT_SCAN)]
@@ -920,22 +1101,26 @@ def run_scan(cfg: dict, db: sqlite3.Connection, notify, force: bool = False) -> 
             continue
         try:
             time.sleep(0.3)
-            e = evaluate_dip(fetch_history(t), cfg)
+            bars = fetch_history(t)
         except Exception:
             failed += 1
             continue
-        if e:
-            hits.append((t, e))
-    log(f"scan: {len(tickers)} stocks checked, {failed} unavailable, {len(hits)} setup(s) found")
-    hits.sort(key=lambda h: (-h[1]["score"], h[1]["rsi_low"]))
+        found = [(b, e) for b in bots if (e := BOTS[b][0](bars, cfg))]
+        if found:
+            hits.append((t, found))
+    log(f"scan: {len(tickers)} stocks checked, {failed} unavailable, {len(hits)} setup(s) found ({', '.join(bots)})")
+    # best first: more bots agreeing, then the higher score, then (for dips) the deeper dip
+    hits.sort(key=lambda h: (-len(h[1]), -max(e["score"] for _, e in h[1]),
+                             min((e.get("rsi_low", 50) for _, e in h[1]), default=50)))
 
     sent = 0
-    for t, e in hits[: cfg["scan_max_alerts"]]:
-        msg = format_dip_alert(t, e, cfg)
+    for t, found in hits[: cfg["scan_max_alerts"]]:
+        msg = format_bot_alert(t, found, cfg)
+        close = found[0][1]["close"]
         bought_cmd = how_to(f"bought {t} <price you paid> <shares>")
         if cfg["auto_track"]:
-            shares = open_tracked_position(db, {"ticker": t, "company": t}, e["close"], cfg)
-            msg += (f"\nTracking a ${cfg['position_usd']:,} trade ({shares} shares at ~${e['close']:,.2f}, the close). "
+            shares = open_tracked_position(db, {"ticker": t, "company": t}, close, cfg, bot="+".join(b for b, _ in found))
+            msg += (f"\nTracking a ${cfg['position_usd']:,} trade ({shares} shares at ~${close:,.2f}, the close). "
                     f"I'll send the sell alert and the % result. Your real price will differ a little.\n"
                     f"Bought it for real? {bought_cmd}")
         else:
@@ -944,6 +1129,47 @@ def run_scan(cfg: dict, db: sqlite3.Connection, notify, force: bool = False) -> 
         meta_set(db, "scan_last_" + t, bar_date)
         sent += 1
     return sent
+
+
+def run_exit_signals(cfg: dict, db: sqlite3.Connection, notify) -> int:
+    """Daily check of open trades for two extra sell signals (on top of the stop-loss, target, trailing stop
+    and time limit): overbought after a gain, and the short-term trend breaking."""
+    if not cfg["exit_signals"]:
+        return 0
+    acted = 0
+    for pos in open_positions(db):
+        if pos["sell_alerted"]:
+            continue
+        try:
+            time.sleep(0.3)
+            bars = fetch_history(pos["ticker"])
+        except Exception:
+            continue
+        reason = exit_signal(bars, pos)
+        if reason:
+            price = bars[-1]["close"]
+            trigger_sell(db, pos, price, reason, notify)
+            acted += 1
+    return acted
+
+
+def exit_signal(bars: list[dict], pos: dict) -> str | None:
+    """Reason to sell from the daily chart, or None. Used live and in the backtest."""
+    closes = [b["close"] for b in bars]
+    if len(closes) < 60:
+        return None
+    entry_day = pos["entry_at"][:10]
+    ret = closes[-1] / pos["entry_price"] - 1
+    r = rsi_series(closes)[-1]
+    if r is not None and r >= 75 and ret >= 0.03:
+        return f"overbought (RSI {r:.0f}) after a {ret:+.1%} gain; the price rose fast, a common time to take profit"
+    if held_days(pos) >= 2:
+        sma20 = lambda i: sum(closes[i - 19:i + 1]) / 20
+        n = len(closes)
+        was_above = any(closes[i] >= sma20(i) for i in range(n - 1) if bars[i]["date"] > entry_day and i >= 19)
+        if was_above and closes[-1] < sma20(n - 1):
+            return "it closed below its 20-day average after being above it, so the short-term trend broke"
+    return None
 
 
 def maybe_scan(cfg: dict, db: sqlite3.Connection, notify) -> None:
@@ -964,30 +1190,48 @@ def maybe_scan(cfg: dict, db: sqlite3.Connection, notify) -> None:
         meta_set(db, "scan_fail", f"{today}:{count}")
         log(f"scan failed ({count} today): {e}")
         if count == 6:
-            notify("⚠️ I couldn't download price data for today's dip scan. I'll keep trying until midnight (UTC).")
+            notify("⚠️ I couldn't download price data for today's scan. I'll keep trying until midnight (UTC).")
         return
     if n is not None:
         meta_set(db, "scan_done", today)
-        log(f"scan done, {n} dip alert(s) sent")
+        log(f"scan done, {n} buy idea(s) sent")
+        try:
+            log(f"exit check done, {run_exit_signals(cfg, db, notify)} sell signal(s)")
+        except Exception as e:
+            log(f"exit check failed: {e}")
 
 
 def cmd_scan(cfg: dict) -> None:
     n = run_scan(cfg, init_db(), make_notifier(cfg), force=True)
-    print(f"Scan finished: {n} dip alert(s).")
+    print(f"Scan finished: {n} buy idea(s).")
 
 
 # --------------------------------------------------------------------------- #
 # Backtest: replay the dip rules on past prices
 # --------------------------------------------------------------------------- #
-def simulate_trade(bars: list[dict], i: int, cfg: dict, hold_days: int):
+def indicators(bars: list[dict]) -> dict:
+    """RSI and 20-day average for every bar, so the backtest can test the extra sell signals quickly."""
+    closes = [b["close"] for b in bars]
+    sma20, run = [None] * len(closes), 0.0
+    for k, c in enumerate(closes):
+        run += c
+        if k >= 20:
+            run -= closes[k - 20]
+        if k >= 19:
+            sma20[k] = run / 20
+    return {"rsi": rsi_series(closes), "sma20": sma20}
+
+
+def simulate_trade(bars: list[dict], i: int, cfg: dict, hold_days: int, ind: dict | None = None):
     """Buy at the NEXT day's open after the signal on bar i, then apply the sell rules.
-    Returns (exit_index, return, reason) or None if the trade is still open at the end of the data."""
+    With `ind` (from indicators()) the extra sell signals are applied too: overbought after a gain, and the
+    short-term trend breaking. Returns (exit_index, return, reason) or None if the trade is still open."""
     j = i + 1
     if j >= len(bars) or bars[j]["open"] <= 0:
         return None
     entry = bars[j]["open"]
     stop, target = entry * (1 - cfg["stop_loss_pct"]), entry * (1 + cfg["take_profit_pct"])
-    peak, d0 = entry, datetime.fromisoformat(bars[j]["date"])
+    peak, d0, above = entry, datetime.fromisoformat(bars[j]["date"]), False
     for k in range(j, len(bars)):
         b = bars[k]
         if b["open"] <= stop:
@@ -999,6 +1243,15 @@ def simulate_trade(bars: list[dict], i: int, cfg: dict, hold_days: int):
         peak = max(peak, b["close"])
         if peak > entry and b["close"] <= peak * (1 - cfg["trailing_stop_pct"]):
             return k, b["close"] / entry - 1, "trailing stop"
+        if ind is not None:
+            r, m = ind["rsi"][k], ind["sma20"][k]
+            if r is not None and r >= 75 and b["close"] / entry - 1 >= 0.03:
+                return k, b["close"] / entry - 1, "overbought"
+            if m is not None:
+                if k > j and b["close"] >= m:
+                    above = True
+                if above and k - j >= 2 and b["close"] < m:
+                    return k, b["close"] / entry - 1, "trend break"
         if (datetime.fromisoformat(b["date"]) - d0).days >= hold_days:
             return k, b["close"] / entry - 1, "time limit"
     return None
@@ -1011,13 +1264,13 @@ def spy_health_by_date(spy: list[dict]) -> dict:
     return ok
 
 
-def scan_signals(bars: list[dict], spy_ok: dict, cfg: dict) -> list:
-    """Every day the scanner would have alerted, using only data up to that day."""
-    out = []
+def scan_signals(bars: list[dict], spy_ok: dict, cfg: dict, bot: str = "dip") -> list:
+    """Every day the bot would have alerted, using only data up to that day."""
+    out, evaluate = [], BOTS[bot][0]
     for i in range(220, len(bars) - 1):
         if not spy_ok.get(bars[i]["date"]):
             continue
-        e = evaluate_dip(bars[max(0, i - 259): i + 1], cfg)
+        e = evaluate(bars[max(0, i - 259): i + 1], cfg)
         if e:
             out.append((i, e))
     return out
@@ -1036,11 +1289,15 @@ def trade_stats(rets: list[float]) -> dict:
             "best": max(rets), "worst": min(rets)}
 
 
-def run_backtest(cfg: dict, data: dict, spy: list[dict], holds: list[int], cost: float) -> dict:
-    """data: ticker -> bars. Applies the same cooldown, one-trade-per-stock and daily alert cap as the live scanner."""
+def run_backtest(cfg: dict, data: dict, spy: list[dict], holds: list[int], cost: float,
+                 bot: str = "dip", exits: bool = False, sigs: dict | None = None) -> dict:
+    """data: ticker -> bars. Applies the same cooldown, one-trade-per-stock and daily alert cap as the live scanner.
+    `exits` adds the overbought and trend-break sell signals."""
     from collections import defaultdict
     spy_ok = spy_health_by_date(spy)
-    sigs = {t: scan_signals(b, spy_ok, cfg) for t, b in data.items()}
+    if sigs is None:
+        sigs = {t: scan_signals(b, spy_ok, cfg, bot) for t, b in data.items()}
+    inds = {t: indicators(b) for t, b in data.items()} if exits else {}
     by_date = defaultdict(list)
     for t, lst in sigs.items():
         for i, e in lst:
@@ -1052,9 +1309,9 @@ def run_backtest(cfg: dict, data: dict, spy: list[dict], holds: list[int], cost:
             day = datetime.fromisoformat(d)
             cands = [c for c in by_date[d] if d > free_at.get(c[0], "")
                      and (c[0] not in last_alert or (day - datetime.fromisoformat(last_alert[c[0]])).days >= cfg["scan_cooldown_days"])]
-            cands.sort(key=lambda c: (-c[2]["score"], c[2]["rsi_low"]))
+            cands.sort(key=lambda c: (-c[2]["score"], c[2].get("rsi_low", 50)))
             for t, i, e in cands[: cfg["scan_max_alerts"]]:
-                r = simulate_trade(data[t], i, cfg, hold)
+                r = simulate_trade(data[t], i, cfg, hold, inds.get(t))
                 if r is None:
                     continue
                 k, ret, reason = r
@@ -1076,9 +1333,10 @@ def run_backtest(cfg: dict, data: dict, spy: list[dict], holds: list[int], cost:
     return results
 
 
-def print_backtest(res: dict, cfg: dict, first: str, last: str, n_stocks: int, years: float, cost: float) -> None:
+def print_backtest(res: dict, cfg: dict, first: str, last: str, n_stocks: int, years: float, cost: float,
+                   name: str = "DIP BOT", exits: bool = False) -> None:
     pc = lambda x: f"{x:+.2%}"
-    print(f"\nDIP-SCANNER BACKTEST: {n_stocks} stocks, {first} -> {last} ({years:g} years requested), "
+    print(f"\n{name.upper()} BACKTEST{' (with the overbought and trend-break sell signals)' if exits else ''}: {n_stocks} stocks, {first} -> {last} ({years:g} years requested), "
           f"costs {cost:.2%} per trade")
     print(f"Rules: buy at the next day's open after the alert; stop-loss -{cfg['stop_loss_pct']:.0%}, profit target "
           f"+{cfg['take_profit_pct']:.0%}, trailing stop {cfg['trailing_stop_pct']:.0%}; at most {cfg['scan_max_alerts']} "
@@ -1110,7 +1368,7 @@ def print_backtest(res: dict, cfg: dict, first: str, last: str, n_stocks: int, y
                 print(f"  {lvl:8}: {st['n']:>3} trades, {st['win']:.0%} winners, average {pc(st['avg'])}")
     print("\nHOW TO READ THIS")
     print(" * 'Baseline' = buying any of these stocks on any day the market was healthy and holding the same time.")
-    print("   The dip rules only help if 'Avg trade' is clearly above the baseline.")
+    print("   A bot only helps if 'Avg trade' is clearly above the baseline.")
     print(" * The stock list is today's big winners, so old results look better than they would have at the time")
     print("   (survivorship bias). Real results are likely worse. Past results do not predict future ones.")
     print(" * Prices are daily, so stop-loss fills are optimistic in fast markets. Taxes and spreads are not included.")
@@ -1135,11 +1393,44 @@ def cmd_backtest_scan(cfg: dict, years: float, holds: list[int], cost_pct: float
             print(f"  [{n}/{len(tickers)}] {t}: skipped ({str(e)[:60]})", flush=True)
     if len(data) < 5:
         sys.exit("Could not download enough price data to run the backtest.")
-    print(f"\nTesting the rules on {len(data)} stocks (this takes a minute)...", flush=True)
-    res = run_backtest(cfg, data, spy, holds, cost)
-    print_backtest(res, cfg, spy[220]["date"], spy[-1]["date"], len(data), years, cost)
+    print(f"\nTesting {len(BOTS)} bots on {len(data)} stocks (this takes a few minutes)...", flush=True)
+    spy_ok = spy_health_by_date(spy)
+    results, alt = {}, {}
+    for bot in BOTS:
+        sigs = {t: scan_signals(b, spy_ok, cfg, bot) for t, b in data.items()}
+        results[bot] = run_backtest(cfg, data, spy, holds, cost, bot, cfg["exit_signals"], sigs)
+        alt[bot] = run_backtest(cfg, data, spy, holds[:1], cost, bot, not cfg["exit_signals"], sigs)
+        print(f"  {BOTS[bot][1]} done", flush=True)
+    first, last = spy[220]["date"], spy[-1]["date"]
+    h0 = holds[0]
+    pc = lambda x: f"{x:+.2%}"
+    print(f"\nSUMMARY: what each bot would have done ({n_years(first, last)}, {len(data)} stocks, max hold {h0} days, "
+          f"costs {cost:.2%} per trade)")
+    print(f"{'Bot':14} {'Trades':>7} {'Win rate':>9} {'Avg trade':>10} {'Baseline':>9}   Verdict")
+    for bot in BOTS:
+        st, bs = results[bot][h0]["stats"], results[bot][h0]["baseline"]
+        if not st["n"]:
+            print(f"{BOTS[bot][1]:14} {0:>7} {'':>9} {'':>10} {'':>9}   no trades (rules never matched)")
+            continue
+        base = bs["avg"] if bs.get("n") else 0.0
+        verdict = ("too few trades to judge" if st["n"] < 30 else
+                   "beat the baseline: keep it on" if st["avg"] > 0 and st["avg"] > base + 0.002 else
+                   "profitable, but no better than buying at random" if st["avg"] > 0 else
+                   "lost money: turn it off")
+        print(f"{BOTS[bot][1]:14} {st['n']:>7} {st['win']:>9.0%} {pc(st['avg']):>10} {pc(base):>9}   {verdict}")
+    print(f"\nExtra sell signals (overbought, trend break), average trade at a {h0}-day max hold:")
+    for bot in BOTS:
+        on, off = (results[bot][h0], alt[bot][h0]) if cfg["exit_signals"] else (alt[bot][h0], results[bot][h0])
+        if on["stats"]["n"] and off["stats"]["n"]:
+            print(f"  {BOTS[bot][1]:14} with {pc(on['stats']['avg'])}, without {pc(off['stats']['avg'])}")
+    for bot in BOTS:
+        print_backtest(results[bot], cfg, first, last, len(data), years, cost, BOTS[bot][1], cfg["exit_signals"])
     if failed:
         print(f"\n(Skipped, no data: {', '.join(failed)})")
+
+
+def n_years(first: str, last: str) -> str:
+    return f"{first} to {last}"
 
 
 # --------------------------------------------------------------------------- #
@@ -1300,6 +1591,62 @@ def encrypt_json(obj, password: str) -> dict:
     return {"v": 1, "kdf": "PBKDF2-SHA256", "iter": PBKDF2_ITERATIONS, "salt": enc(salt), "iv": enc(iv), "ct": enc(ct)}
 
 
+BOT_INFO = {
+    "market": ("Market Watcher", "Checks whether the overall market is healthy. The buy bots pause when it is not."),
+    "insider": ("Insider Bot", "Follows company insiders buying their own stock, checked against the news."),
+    "dip": (BOTS["dip"][1], BOTS["dip"][3]),
+    "breakout": (BOTS["breakout"][1], BOTS["breakout"][3]),
+    "trend": (BOTS["trend"][1], BOTS["trend"][3]),
+    "gap": (BOTS["gap"][1], BOTS["gap"][3]),
+    "exit": ("Exit Bot", "Watches your open trades and tells you when to sell, then reports the profit or loss."),
+}
+
+
+def classify_alert(text: str) -> str:
+    """Which bot sent an alert, judged from its first line. '' if it is none of them."""
+    first = text.split("\n", 1)[0]
+    if "confirmed by" in first:
+        return "multi"
+    for key, word in (("dip", "dip-buy idea"), ("breakout", "breakout idea"), ("trend", "trend idea"),
+                      ("gap", "gap-up idea"), ("insider", "insider buy")):
+        if word in first:
+            return key
+    if "SELL signal" in first or "Trade closed" in first or "Heads-up" in first:
+        return "exit"
+    if "overall market" in first or "\U0001F4C9" in first or "\U0001F4C8" in first:
+        return "market"
+    return ""
+
+
+def bot_rows(cfg: dict, db: sqlite3.Connection, alerts: list[dict]) -> list[dict]:
+    """One row per bot for the app's Bots tab: is it on, when it last spoke, and how its tracked trades did."""
+    on_scan = set(enabled_bots(cfg, db))
+    names = {v[0]: k for k, v in BOT_INFO.items()}
+    closed = [dict(r) for r in db.execute("SELECT bot, pnl, ret FROM positions WHERE status='closed'")]
+    cutoff = (utc_now() - timedelta(days=30)).isoformat(timespec="seconds")
+    rows = []
+    for key in ("market", "insider", "dip", "breakout", "trend", "gap", "exit"):
+        mine, last, n30 = [], "", 0
+        for a in alerts:
+            kind = a["bot"]
+            hit = kind == key
+            if kind == "multi":
+                m = re.search(r"Found by (.+?)\.", a["text"].split("\n", 3)[2] if a["text"].count("\n") >= 2 else "")
+                hit = bool(m) and any(names.get(x.strip()) == key for x in m.group(1).split(" and "))
+            if hit:
+                last = last or a["at"]
+                n30 += a["at"] >= cutoff
+        for c in closed:
+            if key in (c["bot"] or "").split("+"):
+                mine.append(c)
+        wins = sum(1 for c in mine if c["pnl"] > 0)
+        rows.append({"id": key, "name": BOT_INFO[key][0], "what": BOT_INFO[key][1],
+                     "on": key in on_scan if key in BOTS else True, "last_at": last, "alerts30": n30,
+                     "n": len(mine), "wins": wins,
+                     "avg_ret": round(sum(c["ret"] for c in mine) / len(mine), 4) if mine else 0.0})
+    return rows
+
+
 def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=None) -> dict:
     history_fn = history_fn or fetch_history
     closed = [dict(r) for r in db.execute("SELECT * FROM positions WHERE status='closed' ORDER BY exit_at, id")]
@@ -1313,7 +1660,7 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
         last = p["last_price"] or p["entry_price"]
         sell_by = datetime.fromisoformat(p["entry_at"]) + timedelta(days=cfg["max_hold_days"])
         opens.append({"ticker": p["ticker"], "shares": p["shares"], "entry_price": p["entry_price"],
-                      "entry_at": p["entry_at"], "last_price": last, "mine": bool(p["manual"]),
+                      "entry_at": p["entry_at"], "last_price": last, "mine": bool(p["manual"]), "bot": p["bot"] or "",
                       "pnl": round((last - p["entry_price"]) * p["shares"], 2), "ret": round(last / p["entry_price"] - 1, 4),
                       "days": held_days(p), "stop": round(p["entry_price"] * (1 - cfg["stop_loss_pct"]), 2),
                       "target": round(p["entry_price"] * (1 + cfg["take_profit_pct"]), 2),
@@ -1321,11 +1668,13 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
     recent = [
         {"ticker": p["ticker"], "shares": p["shares"], "entry_price": p["entry_price"], "exit_price": p["exit_price"],
          "entry_at": p["entry_at"], "exit_at": p["exit_at"], "pnl": round(p["pnl"], 2), "ret": round(p["ret"], 4),
-         "reason": p["exit_reason"], "mine": bool(p["manual"])} for p in reversed(closed[-30:])]
+         "reason": p["exit_reason"], "mine": bool(p["manual"]), "bot": p["bot"] or ""} for p in reversed(closed[-30:])]
     wins = sum(1 for p in closed if p["pnl"] > 0)
     alerts = []
-    for r in db.execute("SELECT at, text FROM alerts_log ORDER BY id DESC LIMIT 60"):
-        alerts.append({"at": r["at"], "text": r["text"]})
+    for r in db.execute("SELECT at, text FROM alerts_log ORDER BY id DESC LIMIT 300"):
+        alerts.append({"at": r["at"], "text": r["text"], "bot": classify_alert(r["text"])})
+    bots = bot_rows(cfg, db, alerts)
+    alerts = alerts[:60]
     charts, tickers = {}, []
     for t in [p["ticker"] for p in opens] + [p["ticker"] for p in recent[:10]]:
         if t not in tickers:
@@ -1342,9 +1691,10 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
         except Exception:
             pass
     return {"v": 1, "generated_at": now.isoformat(timespec="seconds"),
-            "market": meta_get(db, "market_state"),
+            "market": meta_get(db, "market_state"), "market_info": json.loads(meta_get(db, "market_info", "{}") or "{}"),
+            "bots": bots,
             "rules": {k: cfg[k] for k in ("stop_loss_pct", "take_profit_pct", "trailing_stop_pct", "max_hold_days",
-                                          "position_usd", "auto_track")},
+                                          "position_usd", "auto_track", "exit_signals")},
             "push": {"available": bool(key_pub), "key": key_pub, "devices": len(json.loads(meta_get(db, "push_subs", "[]")))},
             "stats": {"n": len(closed), "wins": wins, "net": round(sum(p["pnl"] for p in closed), 2),
                       "avg_ret": round(sum(p["ret"] for p in closed) / len(closed), 4) if closed else 0.0},
@@ -1354,179 +1704,194 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
 # <<APP_FILES_BEGIN>>
 APP_FILES_B64 = {
     "index.html": (
-        "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"
-        "5Wz65Z3/C/uEE0s="
+        "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"
     ),
     "sw.js": (
         "eNqNVVFvGzcMfvev4O6h0BWJvO6ps+ENQRG0A4KhaBvkYSgKRcfzqZalm6Sza7j+76V4d4ntJtj8chJJkR/Jj/T0Jfzloqkw"
@@ -1958,6 +2323,8 @@ HELP = ("Send me:\n"
         "  bought ACME 24.10 40   (log a buy: ticker, price you paid, shares)\n"
         "  sold ACME 27.10        (log a sale; the price is optional)\n"
         "  positions              (open positions and profits)\n"
+        "  bots                   (which scanner bots are on)\n"
+        "  bot breakout off       (switch a bot off or on: dip, breakout, trend, gap)\n"
         "  push <code>            (connect the iPhone app; the app shows you the code)\n"
         "  help                   (show this)")
 
@@ -1967,6 +2334,29 @@ def _number(s: str) -> float:
         return float(s.replace(",", "."))
     except ValueError:
         raise ValueError(f"'{s}' is not a number") from None
+
+
+def bots_command(db: sqlite3.Connection, cfg: dict, args: list[str]) -> str:
+    off = set(json.loads(meta_get(db, "bots_off", "[]")))
+    if len(args) == 2 and args[1].lower() in ("on", "off"):
+        bot = args[0].lower().replace("-bot", "").replace("bot", "").strip() or args[0].lower()
+        if bot not in BOTS:
+            raise ValueError("Bots you can switch: " + ", ".join(BOTS) + ".   Example:  bot breakout off")
+        if args[1].lower() == "off":
+            off.add(bot)
+        else:
+            off.discard(bot)
+        meta_set(db, "bots_off", json.dumps(sorted(off)))
+        if args[1].lower() == "on" and bot not in [x.lower() for x in cfg["scan_bots"]]:
+            return (f"{BOTS[bot][1]} is allowed again, but your SCAN_BOTS setting on GitHub doesn't include it, "
+                    f"so it stays off until you add it there.")
+        return f"{BOTS[bot][1]} is now {'off' if args[1].lower() == 'off' else 'on'}. It takes effect at the next daily scan."
+    on = enabled_bots(cfg, db)
+    lines = ["Scanner bots (they run once a day after the US market closes):"]
+    for b in BOTS:
+        lines.append(f"  {BOTS[b][1]:14} {'on' if b in on else 'off'}")
+    lines.append("Switch one:  bot breakout off   or   bot breakout on")
+    return "\n".join(lines)
 
 
 def handle_command(text: str, db: sqlite3.Connection, cfg: dict) -> str:
@@ -1984,6 +2374,8 @@ def handle_command(text: str, db: sqlite3.Connection, cfg: dict) -> str:
             return "\n\n".join(log_sold(db, cfg, args[0], _number(args[1]) if len(args) == 2 else None))
         if cmd in ("positions", "position", "pos"):
             return positions_text(db)
+        if cmd in ("bots", "bot"):
+            return bots_command(db, cfg, args)
         if cmd == "push":
             add_push_sub(db, text.partition(" ")[2].strip())
             sent = push_all(db, "✅ Notifications are on\nYou'll get your alerts on this phone too.")
@@ -2256,7 +2648,7 @@ def main(argv=None) -> None:
     ea = sub.add_parser("export-app", help="build the encrypted data file and iPhone web app (used by the cloud job)")
     ea.add_argument("--out", default="site", help="folder to write the website into")
     ea.add_argument("--force", action="store_true", help="publish even if nothing changed")
-    bt = sub.add_parser("backtest-scan", help="replay the dip-buy rules on past prices and show how they would have done")
+    bt = sub.add_parser("backtest-scan", help="replay every buy bot on past prices and show how each would have done")
     bt.add_argument("--years", type=float, default=5, help="years of history to test (default 5)")
     bt.add_argument("--hold-days", type=int, nargs="+", default=[5, 10, 20, 90], help="max holding times to compare")
     bt.add_argument("--cost", type=float, default=0.10, help="trading cost per trade in percent (default 0.10)")
