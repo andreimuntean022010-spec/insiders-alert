@@ -53,6 +53,9 @@ jobs:
           # Dip-buy scanner (runs once a day after the US market closes). SCAN_ENABLED = false turns it off.
           IA_SCAN_ENABLED: ${{ vars.SCAN_ENABLED }}
           IA_SCAN_TICKERS: ${{ vars.SCAN_TICKERS }}
+          # Which scanner bots run: SCAN_BOTS = dip,breakout,trend,gap (default: all four). EXIT_SIGNALS = false turns off the extra sell signals.
+          IA_SCAN_BOTS: ${{ vars.SCAN_BOTS }}
+          IA_EXIT_SIGNALS: ${{ vars.EXIT_SIGNALS }}
           IA_STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT }}
           IA_TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT }}
           IA_TRAILING_STOP_PCT: ${{ vars.TRAILING_STOP_PCT }}
