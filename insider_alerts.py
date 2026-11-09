@@ -109,10 +109,32 @@ DEFAULT_CONFIG = {
     "scan_tickers": [],           # empty = a built-in list of about 70 large, liquid US stocks
     "scan_rsi_dip": 35,           # RSI must have dropped to this level or lower in the last 4 days
     "scan_cooldown_days": 10,     # don't alert the same stock again within this many days
-    "scan_max_alerts": 8,         # at most this many buy ideas per day from the scanner (best first)
+    "scan_max_alerts": 15,        # at most this many buy ideas per day from the scanner (best first)
+    "scan_markets": ["US", "UK", "Germany", "France", "Netherlands", "Switzerland", "Canada", "Australia", "Japan", "Hong Kong", "Romania"],
     "scan_bots": ["dip", "breakout", "trend", "gap"],  # which scanner bots are on (you can also switch them in the chat)
     "exit_signals": True,         # also send sell signals when a trade looks overbought or its short-term trend breaks
     "scan_min_dollar_volume": 20000000,  # skip stocks trading less than this many dollars per day
+    # day trading (15-minute candles, trades opened and closed the same day)
+    "day_enabled": True,
+    "day_markets": ["US", "Germany", "UK"],     # markets scanned while they are open
+    "day_bots": ["orb", "vwap", "gapgo"],       # which day-trading bots are on
+    "day_tickers": [],                          # empty = liquid stocks from the built-in lists
+    "day_target_r": 1.5,                        # profit target = this many times the risk (distance to the stop)
+    "day_max_alerts_per_run": 4,                # at most this many day-trade ideas per 15-minute candle
+    "day_max_alerts_per_day": 25,               # and at most this many a day
+    "day_close_minutes": 20,                    # close day trades this long before the market closes
+    "timezone": "Europe/Bucharest",             # the times shown in day-trade alerts
+    # crypto day trading (Binance 15-minute candles, open 24/7)
+    "crypto_enabled": True,
+    "crypto_coins": [],                         # empty = a built-in list of about 27 large coins, e.g. ["BTC", "ETH"]
+    "crypto_bots": ["cbreak", "cvwap", "cdip"],
+    "crypto_quote": "USDT",                     # the pair used for prices (the most liquid); you may have to trade USDC or EUR pairs
+    "crypto_min_volume_usd": 30000000,          # skip coins that traded less than this over the last 24 hours
+    "crypto_max_hold_hours": 3,                 # close a crypto trade after this long if neither the stop nor the target was hit
+    "crypto_hours": "7-23",                     # only send new ideas between these local hours (0-24 = all day and night)
+    "crypto_max_alerts_per_run": 3,
+    "crypto_max_alerts_per_day": 30,
+    "crypto_cooldown_min": 120,                 # don't repeat the same bot on the same coin within this many minutes
 }
 
 BROWSER_UA = "Mozilla/5.0 (compatible; insider-alerts/1.0)"
@@ -140,8 +162,10 @@ def load_config(strict: bool = True) -> dict:
         val = os.environ.get("IA_" + key.upper())
         if val:
             try:
-                if key == "scan_bots" and not val.lstrip().startswith("["):   # SCAN_BOTS=dip,breakout also works
-                    cfg[key] = [x.strip().lower() for x in val.split(",") if x.strip()]
+                if key in ("scan_bots", "scan_markets", "day_markets", "day_bots", "day_tickers", "crypto_bots", "crypto_coins") and not val.lstrip().startswith("["):   # SCAN_BOTS=dip,breakout also works
+                    keep = key in ("scan_markets", "day_markets")
+                    low = key in ("scan_bots", "day_bots", "crypto_bots")
+                    cfg[key] = [x.strip() if keep else x.strip().lower() if low else x.strip().upper() for x in val.split(",") if x.strip()]
                 else:
                     cfg[key] = val if isinstance(default, str) else json.loads(val)
             except ValueError:
@@ -345,7 +369,9 @@ def fetch_news(company: str, ticker: str, hours: int) -> dict:
 
 
 def fetch_price(ticker: str) -> float | None:
-    """Last close from Stooq (free, no key). Returns None if unavailable."""
+    """Latest price: Stooq for US stocks (free, no key), Yahoo for the rest. None if unavailable."""
+    if market_suffix(ticker):
+        return yahoo_price(ticker)
     sym = ticker.lower().replace(".", "-")
     try:
         raw = http_get(f"https://stooq.com/q/l/?s={sym}.us&f=sd2t2c&h&e=csv", BROWSER_UA, timeout=10, retries=0)
@@ -470,8 +496,11 @@ def init_db() -> sqlite3.Connection:
         manual INTEGER DEFAULT 0, status TEXT DEFAULT 'open',
         sell_alerted INTEGER DEFAULT 0, news_warned INTEGER DEFAULT 0,
         exit_price REAL, exit_at TEXT, exit_reason TEXT, pnl REAL, ret REAL)""")
-    if "bot" not in [r[1] for r in db.execute("PRAGMA table_info(positions)")]:
-        db.execute("ALTER TABLE positions ADD COLUMN bot TEXT DEFAULT ''")
+    have = [r[1] for r in db.execute("PRAGMA table_info(positions)")]
+    for col, decl in (("bot", "TEXT DEFAULT ''"), ("kind", "TEXT DEFAULT 'swing'"), ("stop", "REAL"),
+                      ("target", "REAL"), ("exit_by", "TEXT"), ("mgmt_t", "INTEGER DEFAULT 0")):
+        if col not in have:
+            db.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
     db.commit()
     return db
 
@@ -487,6 +516,10 @@ def open_positions(db: sqlite3.Connection, ticker: str | None = None) -> list[di
     return [dict(r) for r in db.execute(sql + " ORDER BY id", args)]
 
 
+def is_swing(pos: dict) -> bool:
+    return (pos.get("kind") or "swing") == "swing"
+
+
 def held_days(pos: dict) -> int:
     return (utc_now() - datetime.fromisoformat(pos["entry_at"])).days
 
@@ -494,7 +527,7 @@ def held_days(pos: dict) -> int:
 def open_tracked_position(db: sqlite3.Connection, parsed: dict, entry: float, cfg: dict, bot: str = "insider") -> int:
     """Simulated trade opened when a buy alert fires. Returns the share count.
     `bot` says which bot(s) found it, e.g. "insider" or "dip+breakout"."""
-    shares = max(1, int(cfg["position_usd"] // entry))
+    shares = max(1, int(cfg["position_usd"] * usd_rate(parsed["ticker"]) // entry))
     db.execute("INSERT INTO positions (ticker, company, shares, entry_price, entry_at, peak, last_price, manual, bot) "
                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
                (parsed["ticker"], parsed["company"], shares, entry, now_iso(), entry, entry, bot))
@@ -511,7 +544,7 @@ def sell_reason(pos: dict, price: float, cfg: dict, days: int) -> str | None:
     if chg >= cfg["take_profit_pct"]:
         return f"profit target reached ({chg:+.1%} from entry)"
     if peak > entry and price <= peak * (1 - cfg["trailing_stop_pct"]):
-        return f"trailing stop: price fell {1 - price / peak:.1%} from its peak of ${peak:,.2f}"
+        return f"trailing stop: price fell {1 - price / peak:.1%} from its peak of {fp(pos['ticker'], peak)}"
     if days >= cfg["max_hold_days"]:
         return f"held {days} days (limit {cfg['max_hold_days']}); time to free up the money"
     return None
@@ -524,7 +557,7 @@ def totals(db: sqlite3.Connection) -> dict:
 
 
 def close_position(db: sqlite3.Connection, pos: dict, price: float, reason: str) -> tuple[float, float]:
-    pnl = (price - pos["entry_price"]) * pos["shares"]
+    pnl = (price - pos["entry_price"]) * pos["shares"] / usd_rate(pos["ticker"])      # profit in US dollars
     ret = price / pos["entry_price"] - 1
     db.execute("UPDATE positions SET status='closed', exit_price=?, exit_at=?, exit_reason=?, pnl=?, ret=?, "
                "last_price=? WHERE id=?", (price, now_iso(), reason, pnl, ret, price, pos["id"]))
@@ -542,8 +575,8 @@ def format_closed(pos: dict, price: float, reason: str, pnl: float, ret: float, 
     if reason:
         lines.append(f"Reason: {reason}")
     lines += [
-        f"Bought {pos['shares']:g} shares at ${pos['entry_price']:,.2f} on {pos['entry_at'][:10]}, "
-        f"sold at ${price:,.2f} ({days} day{'s' if days != 1 else ''})",
+        f"Bought {pos['shares']:g} shares at {fp(pos['ticker'], pos['entry_price'])} on {pos['entry_at'][:10]}, "
+        f"sold at {fp(pos['ticker'], price)} ({days} day{'s' if days != 1 else ''})",
         f"{icon} {'PROFIT' if pnl >= 0 else 'LOSS'}: {money(pnl)} ({ret:+.1%})",
         f"All closed trades so far: {tot['n']}, {tot['wins']} winner{'s' if tot['wins'] != 1 else ''}, "
         f"net {money(tot['pnl'])}",
@@ -554,13 +587,13 @@ def format_closed(pos: dict, price: float, reason: str, pnl: float, ret: float, 
 
 
 def format_sell_signal(pos: dict, price: float, reason: str) -> str:
-    pnl, ret = (price - pos["entry_price"]) * pos["shares"], price / pos["entry_price"] - 1
+    pnl, ret = (price - pos["entry_price"]) * pos["shares"] / usd_rate(pos["ticker"]), price / pos["entry_price"] - 1
     sold_cmd = how_to("sold %s %.2f" % (pos["ticker"], price))
     return "\n".join([
         f"🔴 SELL signal: {pos['ticker']}",
         f"Reason: {reason}",
-        f"You hold {pos['shares']:g} shares bought at ${pos['entry_price']:,.2f}; "
-        f"now ~${price:,.2f}: {money(pnl)} ({ret:+.1%}) unrealised",
+        f"You hold {pos['shares']:g} shares bought at {fp(pos['ticker'], pos['entry_price'])}; "
+        f"now ~{fp(pos['ticker'], price)}: {money(pnl)} ({ret:+.1%}) unrealised",
         f"After you sell, tell me the price so I can report your profit:\n  {sold_cmd}",
         "Not financial advice.",
     ])
@@ -582,7 +615,7 @@ def check_positions(cfg: dict, db: sqlite3.Connection, notify) -> int:
     """Look up the latest price of each open position and apply the sell rules."""
     acted = 0
     for pos in open_positions(db):
-        if pos["sell_alerted"]:
+        if pos["sell_alerted"] or not is_swing(pos):
             continue
         price = fetch_price(pos["ticker"])
         if price is None:
@@ -614,7 +647,7 @@ def handle_insider_sales(cfg: dict, db: sqlite3.Connection, parsed: dict, notify
     sale = sum(s["shares"] * s["price"] for s in parsed["sells"])
     if sale < cfg["min_insider_sale_usd"]:
         return
-    held = [p for p in open_positions(db, parsed["ticker"]) if not p["sell_alerted"]]
+    held = [p for p in open_positions(db, parsed["ticker"]) if not p["sell_alerted"] and is_swing(p)]
     if not held:
         return
     price = fetch_price(parsed["ticker"])
@@ -658,10 +691,11 @@ def log_bought(db: sqlite3.Connection, ticker: str, price: float, shares: float,
                    "VALUES (?, '', ?, ?, ?, ?, ?, 1)", (t, shares, price, now_iso(), price, price))
     db.commit()
     verb = "send" if CHAT_MODE else "run"
-    return (f"Logged: {shares:g} {t} at ${price:,.2f}. I'll alert you to sell at ${price * (1 - cfg['stop_loss_pct']):,.2f} "
-            f"(stop-loss) or ${price * (1 + cfg['take_profit_pct']):,.2f} (profit target), if it falls "
+    note = market_price_note(t, price)
+    return (f"Logged: {shares:g} {t} at {fp(t, price)}. I'll alert you to sell at {fp(t, price * (1 - cfg['stop_loss_pct']))} "
+            f"(stop-loss) or {fp(t, price * (1 + cfg['take_profit_pct']))} (profit target), if it falls "
             f"{cfg['trailing_stop_pct']:.0%} from its peak after gaining, after {cfg['max_hold_days']} days, "
-            f"or if insiders start selling.\nWhen you sell, {verb}:  {how_to('sold ' + t + ' <price>')}")
+            f"or if insiders start selling.\nWhen you sell, {verb}:  {how_to('sold ' + t + ' <price>')}" + note)
 
 
 def cmd_bought(db: sqlite3.Connection, ticker: str, price: float, shares: float, cfg: dict) -> None:
@@ -676,6 +710,7 @@ def log_sold(db: sqlite3.Connection, cfg: dict, ticker: str, price: float | None
     held = open_positions(db, t)
     if not held:
         raise ValueError(f"No open {t} position. See:  {how_to('positions')}")
+    typed = price is not None
     if price is None:
         price = fetch_price(t)
         if price is None:
@@ -684,6 +719,8 @@ def log_sold(db: sqlite3.Connection, cfg: dict, ticker: str, price: float | None
     for pos in held:
         pnl, ret = close_position(db, pos, price, "sold by you")
         texts.append(format_closed(pos, price, "", pnl, ret, totals(db), via_signal=False))
+    if typed and texts:
+        texts[-1] += market_price_note(t, price)
     return texts
 
 
@@ -702,9 +739,9 @@ def positions_text(db: sqlite3.Connection) -> str:
     lines = ["OPEN POSITIONS (last price = most recent check)" if opens else "No open positions."]
     for p in opens:
         px = p["last_price"] or p["entry_price"]
-        lines.append(f"  {p['ticker']:6} {p['shares']:g} sh  in ${p['entry_price']:,.2f} ({p['entry_at'][:10]})  "
-                     f"last ${px:,.2f}  {money((px - p['entry_price']) * p['shares'])} ({px / p['entry_price'] - 1:+.1%})  "
-                     f"{'yours' if p['manual'] else 'simulated'}")
+        lines.append(f"  {p['ticker']:6} {p['shares']:g} sh  in {fp(p['ticker'], p['entry_price'])} ({p['entry_at'][:10]})  "
+                     f"last {fp(p['ticker'], px)}  {money((px - p['entry_price']) * p['shares'] / usd_rate(p['ticker']))} ({px / p['entry_price'] - 1:+.1%})  "
+                     f"{'yours' if p['manual'] else 'simulated day trade' if p.get('kind') == 'day' else 'simulated crypto trade' if p.get('kind') == 'crypto' else 'simulated'}")
     closed = [dict(r) for r in db.execute("SELECT * FROM positions WHERE status='closed' ORDER BY exit_at")]
     if closed:
         lines += ["", "CLOSED TRADES"]
@@ -726,7 +763,104 @@ def cmd_positions(db: sqlite3.Connection) -> None:
 DEFAULT_SCAN = ("AAPL MSFT NVDA AMZN GOOGL META AVGO TSLA LLY JPM V UNH XOM MA COST HD PG JNJ ABBV NFLX "
                 "BAC CRM ORCL WMT KO MRK CVX AMD PEP ADBE TMO LIN CSCO ACN MCD ABT DIS WFC GE IBM QCOM "
                 "TXN INTU CAT AMGN VZ NOW AMAT PFE ISRG GS UBER BKNG SPGI LOW HON UNP T RTX NEE PGR DE "
-                "LRCX ADP BLK ETN SBUX MU").split()
+                "LRCX ADP BLK ETN SBUX MU "
+                "PANW CMG KLAC SNPS CDNS MDLZ MMC CB SO DUK ICE CME MCO AON CI ELV REGN VRTX GILD BSX SYK "
+                "MDT ZTS BDX HCA CVS MO PM TJX NKE ORLY AZO ROST MAR HLT YUM DG DLTR LULU EL CL KMB GIS "
+                "HSY STZ KR SYY ADM TGT BMY SCHW MS C USB PNC TFC COF AXP MET PRU AIG TRV ALL AFL CINF "
+                "FI FIS PYPL ANET FTNT MSI APH TEL GLW HPQ DELL STX WDC NXPI ON MCHP ADI MPWR SWKS TER "
+                "ZS CRWD DDOG NET SNOW TEAM WDAY ADSK ROP CTSH EPAM GDDY PLTR SHOP SQ ABNB DASH LYFT EXPE "
+                "COP EOG SLB OXY PSX MPC VLO HAL BKR KMI WMB OKE FANG DVN HES CTRA APA "
+                "LMT NOC GD LHX TDG BA HII TXT CARR OTIS MMM EMR ITW PH ROK CMI PCAR FDX UPS CSX NSC DAL UAL LUV "
+                "WM RSG ECL SHW APD DD DOW NUE STLD FCX NEM MLM VMC "
+                "AMT PLD CCI EQIX PSA O SPG WELL DLR AVB EQR "
+                "D AEP EXC SRE XEL ED PEG WEC EIX PCG "
+                "F GM TM HMC APTV BWA LKQ "
+                "DHR A IQV IDXX MTD WAT EW ALGN RMD DXCM PODD HOLX "
+                "CHTR CMCSA TMUS WBD PARA FOXA EA TTWO MTCH "
+                "ADBE PAYX ZBRA TRMB KEYS "
+                "AMP BK STT NTRS RJF FITB HBAN RF KEY CFG MTB "
+                "GPC POOL TSCO ULTA BBY KMX DRI DPZ").split()
+DEFAULT_SCAN = list(dict.fromkeys(DEFAULT_SCAN))
+
+# --------------------------------------------------------------------------- #
+# Stocks outside the US. They carry the Yahoo exchange ending (SAP.DE, 7203.T).
+# suffix -> (market, index used as that market's health check, price prefix, price ending, decimals,
+#            local currency per 1 US dollar, rough, only used for position sizes and $ profit)
+# --------------------------------------------------------------------------- #
+MARKETS = {
+    "": ("US", "SPY", "$", "", 2, 1.0),
+    "L": ("UK", "^FTSE", "", "p", 1, 79.0),            # London prices are in pence
+    "DE": ("Germany", "^GDAXI", "€", "", 2, 0.92),
+    "PA": ("France", "^FCHI", "€", "", 2, 0.92),
+    "AS": ("Netherlands", "^AEX", "€", "", 2, 0.92),
+    "SW": ("Switzerland", "^SSMI", "CHF ", "", 2, 0.88),
+    "TO": ("Canada", "^GSPTSE", "C$", "", 2, 1.38),
+    "AX": ("Australia", "^AXJO", "A$", "", 2, 1.52),
+    "T": ("Japan", "^N225", "¥", "", 0, 150.0),
+    "HK": ("Hong Kong", "^HSI", "HK$", "", 2, 7.8),
+    "RO": ("Romania", None, "", " RON", 2, 4.6),       # no index available: only the stock's own trend is checked
+}
+GLOBAL_SCAN = {
+    "L": "SHEL AZN HSBA ULVR BP GSK RIO BATS DGE REL LSEG NG CPG BA LLOY BARC VOD GLEN AAL PRU TSCO RKT NWG STAN EXPN SSE FLTR WPP",
+    "DE": "SAP SIE ALV DTE AIR MBG BMW VOW3 BAS BAYN ADS IFX MUV2 DB1 RWE EOAN HEN3 DHL MRK SY1 CON FRE HNR1",
+    "PA": "MC OR TTE SAN RMS SU AI BNP CS EL KER DG SAF CAP ORA VIE ENGI",
+    "AS": "ASML INGA PHIA HEIA AD WKL PRX ADYEN NN",
+    "SW": "NESN ROG NOVN UBSG ZURN ABBN CFR LONN SIKA GIVN HOLN",
+    "TO": "RY TD ENB CNQ SHOP CP CNR BMO BNS SU TRP ATD CM MFC NTR WCN FNV AEM",
+    "AX": "BHP CBA CSL NAB WBC ANZ WES MQG FMG WOW TLS GMG COL",
+    "T": "7203 6758 9984 8306 6861 9432 6098 8035 4063 7974 6501 8058 9983 4519 6902",
+    "HK": "0700 9988 0939 1299 0005 3690 1810 2318 0941 1211 9618 1398",
+    "RO": "TLV SNP H2O SNG SNN BRD TGN EL M",
+}
+GLOBAL_TICKERS = [f"{t}.{suf}" for suf, names in GLOBAL_SCAN.items() for t in names.split()]
+
+
+def market_suffix(ticker: str) -> str:
+    """'' for US tickers (BRK.B counts as US), otherwise the exchange ending such as 'DE'."""
+    if "." in ticker:
+        end = ticker.rsplit(".", 1)[1].upper()
+        if end in MARKETS and end:
+            return end
+    return ""
+
+
+def market_name(ticker: str) -> str:
+    return MARKETS[market_suffix(ticker)][0]
+
+
+def usd_rate(ticker: str) -> float:
+    return MARKETS[market_suffix(ticker)][5]
+
+
+def is_crypto(ticker: str) -> bool:
+    return ticker.endswith(("USDT", "USDC")) and ticker.isalpha() and ticker.isupper() and len(ticker) > 5
+
+
+def fp(ticker: str, x: float) -> str:
+    """A price in the right currency for that stock: $12.30, €45.10, 7,350p, ¥2,950. Crypto gets more decimals for cheap coins."""
+    if is_crypto(ticker):
+        return f"${x:,.2f}" if x >= 100 else f"${x:,.4f}" if x >= 1 else f"${x:,.5f}" if x >= 0.01 else f"${x:.7f}"
+    _, _, pre, end, dec, _ = MARKETS[market_suffix(ticker)]
+    return f"{pre}{x:,.{dec}f}{end}"
+
+
+def min_turnover(cfg: dict, ticker: str) -> float:
+    """Daily trading volume (in the stock's own currency) a stock needs to count as easy to trade.
+    Small markets like Romania are far thinner, so their limit is a tenth of the usual one."""
+    return cfg["scan_min_dollar_volume"] * usd_rate(ticker) * (0.1 if market_suffix(ticker) == "RO" else 1.0)
+
+
+def cur_of(ticker: str) -> list:
+    """[prefix, ending, decimals] so the app can show a stock's price in its own currency."""
+    _, _, pre, end, dec, _ = MARKETS[market_suffix(ticker)]
+    return [pre, end, dec]
+
+
+def scan_universe(cfg: dict) -> list[str]:
+    if cfg["scan_tickers"]:
+        return [t.upper() for t in cfg["scan_tickers"]]
+    on = {m.lower() for m in cfg["scan_markets"]}
+    return [t for t in DEFAULT_SCAN + GLOBAL_TICKERS if market_name(t).lower() in on]
 
 
 def utc_now() -> datetime:
@@ -768,29 +902,37 @@ def parse_yahoo_json(raw: bytes) -> list[dict]:
     return bars
 
 
-def fetch_history(ticker: str, days: int = 420) -> list[dict]:
-    """Daily prices for the last `days` calendar days. Tries Stooq first, then Yahoo."""
+def yahoo_symbol(ticker: str) -> str:
+    """Yahoo's spelling: BRK.B -> BRK-B, but SAP.DE and ^FTSE stay as they are."""
+    t = ticker.upper()
+    return urllib.parse.quote(t if t.startswith("^") or market_suffix(t) else t.replace(".", "-"))
+
+
+def fetch_history(ticker: str, days: int = 420, min_bars: int = 210) -> list[dict]:
+    """Daily prices for the last `days` calendar days. US stocks: Stooq first, then Yahoo. Others: Yahoo."""
     sym = ticker.lower().replace(".", "-")
+    us = not ticker.startswith("^") and not market_suffix(ticker)
     now = utc_now()
     start = now - timedelta(days=days)
     d1, d2, first = start.strftime("%Y%m%d"), now.strftime("%Y%m%d"), start.strftime("%Y-%m-%d")
     yrange = "2y" if days <= 730 else "5y" if days <= 1825 else "10y"
     errors = []
-    try:
-        bars = parse_stooq_csv(http_get(f"https://stooq.com/q/d/l/?s={sym}.us&i=d&d1={d1}&d2={d2}",
-                                        BROWSER_UA, timeout=20, retries=1))
-        bars = [b for b in bars if b["date"] >= first]
-        if len(bars) >= 210:
-            return bars
-        errors.append("Stooq: too little data")
-    except Exception as e:
-        errors.append(f"Stooq: {e}")
+    if us:
+        try:
+            bars = parse_stooq_csv(http_get(f"https://stooq.com/q/d/l/?s={sym}.us&i=d&d1={d1}&d2={d2}",
+                                            BROWSER_UA, timeout=20, retries=1))
+            bars = [b for b in bars if b["date"] >= first]
+            if len(bars) >= min_bars:
+                return bars
+            errors.append("Stooq: too little data")
+        except Exception as e:
+            errors.append(f"Stooq: {e}")
     try:
         bars = parse_yahoo_json(http_get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper().replace('.', '-')}?range={yrange}&interval=1d",
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol(ticker)}?range={yrange}&interval=1d",
             BROWSER_UA, timeout=20, retries=1))
         bars = [b for b in bars if b["date"] >= first]
-        if len(bars) >= 210:
+        if len(bars) >= min_bars:
             return bars
         errors.append("Yahoo: too little data")
     except Exception as e:
@@ -1030,7 +1172,7 @@ def format_bot_alert(ticker: str, hits: list, cfg: dict) -> str:
         head = f"🟢 STRONG idea confirmed by {len(hits)} bots: {ticker}"
         why = [f"{BOTS[b][1]}: {'; '.join(x['why'][1:] or x['why'])}" for b, x in hits]
         head_note = f"Found by {names}. When more than one bot agrees, I treat it as stronger."
-    lines = [head, f"Price ${e['close']:,.2f} (close of {e['date']})"
+    lines = [head, f"Price {fp(ticker, e['close'])} (close of {e['date']})"
              + (f" | typical daily move ±{e['atr']:.1%}" if e.get("atr") else "")]
     if len(hits) > 1:
         lines.append(head_note)
@@ -1044,7 +1186,7 @@ def format_bot_alert(ticker: str, hits: list, cfg: dict) -> str:
 def format_dip_alert(ticker: str, e: dict, cfg: dict) -> str:
     icon = {"STRONG": "🟢", "MODERATE": "🟡", "WEAK": "⚪"}[e["level"]]
     lines = [f"{icon} {e['level']} dip-buy idea: {ticker}",
-             f"Price ${e['close']:,.2f} (close of {e['date']}) | RSI dipped to {e['rsi_low']:.0f}, now {e['rsi_now']:.0f} | "
+             f"Price {fp(ticker, e['close'])} (close of {e['date']}) | RSI dipped to {e['rsi_low']:.0f}, now {e['rsi_now']:.0f} | "
              f"pullback {e['pullback']:.1%} from the 10-day high",
              f"Trend: {e['vs50']:+.1%} vs 50-day average, {e['vs200']:+.1%} vs 200-day average"
              + (f" | typical daily move ±{e['atr']:.1%}" if e["atr"] else ""),
@@ -1080,35 +1222,55 @@ def run_scan(cfg: dict, db: sqlite3.Connection, notify, force: bool = False) -> 
     if state != prev:
         meta_set(db, "market_state", state)
         if not healthy:
-            notify("📉 The overall market (S&P 500) is below its 200-day average, a weak phase. "
-                   "I'm pausing all buy ideas until it recovers. Insider alerts and sell signals keep running.")
+            notify("📉 The US market (S&P 500) is below its 200-day average, a weak phase. "
+                   "I'm pausing all buy ideas for US stocks until it recovers (other countries are checked against their own market). "
+                   "Insider alerts and sell signals keep running.")
         elif prev == "down":
-            notify("📈 The overall market is back above its 200-day average. Buy ideas are on again.")
+            notify("📈 The US market is back above its 200-day average. Buy ideas for US stocks are on again.")
     meta_set(db, "scan_bar", bar_date)
-    if not healthy:
-        log("scan: market below its 200-day average, no buy ideas")
-        return 0
 
     bots = enabled_bots(cfg, db)
     held = {p["ticker"] for p in open_positions(db)}
     hits, failed = [], 0
-    tickers = [t.upper() for t in (cfg["scan_tickers"] or DEFAULT_SCAN)]
+    tickers = scan_universe(cfg)
+    health = {"": info}                              # market ending -> that market's health (None: no index, no filter)
+    regions = {"US": info}
+    paused = set()
     for t in tickers:
         if t in held:
+            continue
+        suf = market_suffix(t)
+        if suf not in health:
+            index = MARKETS[suf][1]
+            try:
+                health[suf] = market_info(fetch_history(index)) if index else None
+            except Exception as e:
+                log(f"scan: no {MARKETS[suf][0]} market data ({str(e)[:60]}), checking its stocks without a market filter")
+                health[suf] = None
+            if health[suf]:
+                regions[MARKETS[suf][0]] = health[suf]
+        if health[suf] and health[suf]["state"] == "down":
+            paused.add(MARKETS[suf][0])
             continue
         last = meta_get(db, "scan_last_" + t)
         if last and (datetime.fromisoformat(bar_date) - datetime.fromisoformat(last)).days < cfg["scan_cooldown_days"]:
             continue
         try:
-            time.sleep(0.3)
+            time.sleep(0.15)
             bars = fetch_history(t)
         except Exception:
             failed += 1
             continue
-        found = [(b, e) for b in bots if (e := BOTS[b][0](bars, cfg))]
+        if (datetime.fromisoformat(bar_date) - datetime.fromisoformat(bars[-1]["date"])).days > 4:
+            failed += 1                                   # no recent prices (delisted or a long holiday)
+            continue
+        cfg_t = {**cfg, "scan_min_dollar_volume": min_turnover(cfg, t)}   # money in the stock's own currency
+        found = [(b, e) for b in bots if (e := BOTS[b][0](bars, cfg_t))]
         if found:
             hits.append((t, found))
-    log(f"scan: {len(tickers)} stocks checked, {failed} unavailable, {len(hits)} setup(s) found ({', '.join(bots)})")
+    meta_set(db, "regions_info", json.dumps(regions))
+    log(f"scan: {len(tickers)} stocks, {failed} unavailable, {len(hits)} setup(s) found ({', '.join(bots)})"
+        + (f"; paused, weak market: {', '.join(sorted(paused))}" if paused else ""))
     # best first: more bots agreeing, then the higher score, then (for dips) the deeper dip
     hits.sort(key=lambda h: (-len(h[1]), -max(e["score"] for _, e in h[1]),
                              min((e.get("rsi_low", 50) for _, e in h[1]), default=50)))
@@ -1118,12 +1280,21 @@ def run_scan(cfg: dict, db: sqlite3.Connection, notify, force: bool = False) -> 
         msg = format_bot_alert(t, found, cfg)
         close = found[0][1]["close"]
         bought_cmd = how_to(f"bought {t} <price you paid> <shares>")
-        if cfg["auto_track"]:
+        checks, ok = verify_idea(t, close, cfg)
+        bump(db, "check_ideas")
+        if not ok:
+            bump(db, "check_flagged")
+        msg += "\nCheck Bot (second look):\n  " + "\n  ".join(checks)
+        if not ok:
+            head, _, rest = msg.partition("\n")
+            msg = re.sub(r"^\S+ (STRONG|MODERATE|WEAK)", "⚠️ CAUTION", head) + "\n" + rest
+            msg += "\nI'd skip this one, so I'm not tracking a trade for it."
+        elif cfg["auto_track"]:
             shares = open_tracked_position(db, {"ticker": t, "company": t}, close, cfg, bot="+".join(b for b, _ in found))
-            msg += (f"\nTracking a ${cfg['position_usd']:,} trade ({shares} shares at ~${close:,.2f}, the close). "
+            msg += (f"\nTracking a ${cfg['position_usd']:,} trade ({shares} shares at ~{fp(t, close)}, the close). "
                     f"I'll send the sell alert and the % result. Your real price will differ a little.\n"
                     f"Bought it for real? {bought_cmd}")
-        else:
+        if ok and not cfg["auto_track"]:
             msg += f"\nIf you buy it, log it so I can tell you when to sell:\n  {bought_cmd}"
         notify(msg)
         meta_set(db, "scan_last_" + t, bar_date)
@@ -1138,7 +1309,7 @@ def run_exit_signals(cfg: dict, db: sqlite3.Connection, notify) -> int:
         return 0
     acted = 0
     for pos in open_positions(db):
-        if pos["sell_alerted"]:
+        if pos["sell_alerted"] or not is_swing(pos):
             continue
         try:
             time.sleep(0.3)
@@ -1172,6 +1343,101 @@ def exit_signal(bars: list[dict], pos: dict) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Check Bot: a second look at every buy idea and at the prices in your trades
+# --------------------------------------------------------------------------- #
+def bump(db: sqlite3.Connection, key: str, n: int = 1) -> None:
+    meta_set(db, key, int(meta_get(db, key, "0") or 0) + n)
+
+
+def yahoo_price(ticker: str) -> float | None:
+    """A second, independent live price (Yahoo), so one bad data source can't fool us."""
+    try:
+        raw = http_get(f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol(ticker)}"
+                       "?range=1d&interval=1d", BROWSER_UA, timeout=10, retries=0)
+        px = json.loads(raw)["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        return float(px) if px else None
+    except Exception:
+        return None
+
+
+def verify_idea(ticker: str, close: float, cfg: dict) -> tuple[list[str], bool]:
+    """Second look at a buy idea before it is sent. Returns (lines for the alert, okay_to_track).
+    Checks the live price against the close the idea was based on (two sources) and the latest news."""
+    lines, ok = [], True
+    quotes = [q for q in ((fetch_price(ticker), yahoo_price(ticker)) if not market_suffix(ticker) else (yahoo_price(ticker),)) if q]
+    if not quotes:
+        lines.append("Couldn't double-check the live price right now (no price source answered).")
+    else:
+        if len(quotes) == 2 and abs(quotes[0] / quotes[1] - 1) > 0.03:
+            lines.append(f"⚠️ My two price sources disagree ({fp(ticker, quotes[0])} vs {fp(ticker, quotes[1])}). "
+                         "Look the price up yourself before buying.")
+            ok = False
+        else:
+            q = quotes[-1]
+            diff = q / close - 1
+            if abs(diff) > 0.05:
+                lines.append(f"⚠️ The live price ({fp(ticker, q)}) is {diff:+.1%} from the close this idea was based on "
+                             f"({fp(ticker, close)}). It has already moved, so don't chase it.")
+                ok = False
+            else:
+                lines.append(f"✔ Live price {fp(ticker, q)} matches the close ({fp(ticker, close)}), {diff:+.1%}.")
+    try:
+        news = fetch_news(ticker, ticker, cfg["news_hours"])
+        if news["label"] == "negative" and news["neg"] - news["pos"] >= 2:
+            bad = [t for t, sc in news["items"] if sc < 0][:2]
+            lines.append("⚠️ Recent news looks negative: " + "; ".join(t[:90] for t in bad))
+            ok = False
+        else:
+            lines.append("✔ No clearly negative news in the last %d hours." % cfg["news_hours"])
+    except Exception:
+        lines.append("Couldn't check the news right now.")
+    return lines, ok
+
+
+def market_price_note(ticker: str, price: float) -> str:
+    """For a trade you log by hand: warn if the price you typed is far from the market price (a typo?)."""
+    try:
+        q = fetch_price(ticker) or yahoo_price(ticker)
+    except Exception:
+        q = None
+    if q and abs(price / q - 1) > 0.10:
+        return (f"\n⚠️ Check Bot: {fp(ticker, price)} is {price / q - 1:+.0%} from the latest price ({fp(ticker, q)}). "
+                f"Typo? If so, send  sold {ticker.upper()} {price:g}  and then log it again with the right price.")
+    return ""
+
+
+def run_trade_audit(cfg: dict, db: sqlite3.Connection, notify) -> int:
+    """Re-checks recently closed trades against the daily prices: was the entry and exit price really
+    traded that day, and does the profit add up? Each trade is audited once. Returns the number flagged."""
+    done = set(json.loads(meta_get(db, "audited_ids", "[]")))
+    since = (utc_now() - timedelta(days=14)).isoformat(timespec="seconds")
+    flagged = 0
+    rows = [dict(r) for r in db.execute("SELECT * FROM positions WHERE status='closed' AND exit_at>=? AND COALESCE(kind, 'swing') <> 'crypto' ORDER BY id", (since,))]
+    for pos in [r for r in rows if r["id"] not in done][:15]:
+        try:
+            time.sleep(0.3)
+            bars = {b["date"]: b for b in fetch_history(pos["ticker"], 60, min_bars=20)}
+        except Exception:
+            continue                                   # try again on the next daily run
+        problems = []
+        for label, px, at in (("bought", pos["entry_price"], pos["entry_at"]), ("sold", pos["exit_price"], pos["exit_at"])):
+            b = bars.get(at[:10])
+            if b and not (b["low"] * 0.98 <= px <= b["high"] * 1.02):
+                problems.append(f"you {label} at {fp(pos['ticker'], px)} on {at[:10]}, but that day's range was {fp(pos['ticker'], b['low'])} to {fp(pos['ticker'], b['high'])}")
+        if abs((pos["exit_price"] - pos["entry_price"]) * pos["shares"] / usd_rate(pos["ticker"]) - pos["pnl"]) > 0.02:
+            problems.append("the profit doesn't match the prices")
+        done.add(pos["id"])
+        bump(db, "audit_checked")
+        if problems:
+            flagged += 1
+            bump(db, "audit_flagged")
+            notify(f"⚠️ Check Bot: please double-check your {pos['ticker']} trade: " + "; ".join(problems)
+                   + ". If a price was a typo, the reported % may be wrong.")
+    meta_set(db, "audited_ids", json.dumps(sorted(done)[-200:]))
+    return flagged
+
+
 def maybe_scan(cfg: dict, db: sqlite3.Connection, notify) -> None:
     """Run the daily scan after the US market has closed (weekdays, 21:45 UTC or later), once per day."""
     if not cfg["scan_enabled"]:
@@ -1199,11 +1465,1319 @@ def maybe_scan(cfg: dict, db: sqlite3.Connection, notify) -> None:
             log(f"exit check done, {run_exit_signals(cfg, db, notify)} sell signal(s)")
         except Exception as e:
             log(f"exit check failed: {e}")
+        try:
+            log(f"trade audit done, {run_trade_audit(cfg, db, notify)} trade(s) flagged")
+        except Exception as e:
+            log(f"trade audit failed: {e}")
 
 
 def cmd_scan(cfg: dict) -> None:
     n = run_scan(cfg, init_db(), make_notifier(cfg), force=True)
     print(f"Scan finished: {n} buy idea(s).")
+
+
+# --------------------------------------------------------------------------- #
+# Day trading: 15-minute candles, trades opened and closed the same day
+# --------------------------------------------------------------------------- #
+DAY_BOTS = {
+    "orb": ("Opening Range Bot", "Stocks that break above the high of their first 30 minutes on heavy volume."),
+    "vwap": ("VWAP Bot", "Stocks that are up on the day, dipped under the day's average price (VWAP) and just climbed back above it."),
+    "gapgo": ("Gap-and-Go Bot", "Stocks that gapped up at the open, held the gap and are now breaking to a new high of the day."),
+}
+DAY_EXTRA_US = ("AMD PLTR COIN MSTR SMCI UBER SHOP PYPL SNOW CRWD PANW MU INTC BAC WFC C F GM RIVN SOFI HOOD RBLX DKNG "
+                "ROKU ABNB DIS NKE BA CAT GE QCOM TXN AMAT LRCX ARM MRVL SNAP PINS ENPH FSLR MARA RIOT")
+# UTC minutes after midnight between which a market is worth checking. Summer time moves the real hours by
+# an hour, so the windows are wide; the candles themselves tell whether the market is really open.
+DAY_WINDOWS = {"US": (13 * 60 + 30, 21 * 60 + 5), "Canada": (13 * 60 + 30, 21 * 60 + 5),
+               "UK": (7 * 60, 16 * 60 + 35), "Germany": (7 * 60, 16 * 60 + 35), "France": (7 * 60, 16 * 60 + 35),
+               "Netherlands": (7 * 60, 16 * 60 + 35), "Switzerland": (7 * 60, 16 * 60 + 35)}
+SUFFIX_OF = {v[0]: k for k, v in MARKETS.items()}
+CANDLE = 900  # seconds in one 15-minute candle
+
+
+def tz_of(cfg: dict):
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(cfg.get("timezone") or "UTC")
+    except Exception:
+        return timezone.utc
+
+
+def hm(cfg: dict, ts: float) -> str:
+    """A clock time in your time zone, e.g. 16:45 (marked UTC if the time zone database is missing)."""
+    tz = tz_of(cfg)
+    return datetime.fromtimestamp(ts, tz).strftime("%H:%M") + (" UTC" if tz is timezone.utc else "")
+
+
+def parse_yahoo_intraday(raw: bytes) -> dict:
+    """15-minute candles grouped into trading days, plus the live price and the session hours."""
+    res = json.loads(raw)["chart"]["result"][0]
+    meta = res.get("meta") or {}
+    q = res["indicators"]["quote"][0]
+    vols = q.get("volume") or []
+    bars = []
+    for i, ts in enumerate(res.get("timestamp") or []):
+        try:
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+        except (KeyError, IndexError):
+            continue
+        if None in (o, h, l, c):
+            continue
+        bars.append({"t": int(ts), "open": float(o), "high": float(h), "low": float(l), "close": float(c),
+                     "volume": float(vols[i]) if i < len(vols) and vols[i] else 0.0})
+    bars.sort(key=lambda b: b["t"])
+    off = int(meta.get("gmtoffset") or 0)
+    sessions, days = [], []
+    for b in bars:
+        d = (b["t"] + off) // 86400
+        if days and days[-1] == d:
+            sessions[-1].append(b)
+        else:
+            days.append(d)
+            sessions.append([b])
+    reg = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+    live = meta.get("regularMarketPrice")
+    return {"sessions": sessions, "days": days, "off": off, "live": float(live) if live else None,
+            "start": reg.get("start"), "end": reg.get("end")}
+
+
+def fetch_intraday(ticker: str, rng: str = "10d") -> dict:
+    return parse_yahoo_intraday(http_get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol(ticker)}?range={rng}&interval=15m",
+        BROWSER_UA, timeout=15, retries=1))
+
+
+def session_len(data: dict) -> int:
+    """How many 15-minute candles a full trading day has on this exchange."""
+    if data.get("start") and data.get("end") and data["days"] and data["end"] > data["start"] \
+            and (data["end"] + data["off"]) // 86400 == data["days"][-1]:
+        return max(8, round((data["end"] - data["start"]) / CANDLE))
+    prior = [len(s) for s in data["sessions"][:-1]]
+    return max(prior) if prior else 26
+
+
+def session_end(data: dict, first_t: int) -> float:
+    if data.get("end") and data["days"] and (data["end"] + data["off"]) // 86400 == data["days"][-1]:
+        return float(data["end"])
+    return first_t + session_len(data) * CANDLE
+
+
+def idx_state(prev_close: float, S: list[dict]) -> dict:
+    """Is the market itself holding up today? Not more than 0.25% under its open and 1% under yesterday's close."""
+    c = S[-1]["close"]
+    return {"ok": c / S[0]["open"] - 1 > -0.0025 and c / prev_close - 1 > -0.01,
+            "chg_open": c / S[0]["open"] - 1, "chg_prev": c / prev_close - 1}
+
+
+def day_ctx(prior: list[list[dict]], S: list[dict], n_total: int, ticker: str = "") -> dict | None:
+    """The numbers the day bots look at, using only candles up to the last one in S (today's finished candles)."""
+    prior = [p for p in prior if p][-8:]
+    if len(S) < 2 or len(prior) < 3:
+        return None
+    i = len(S) - 1
+    cumv = cumpv = 0.0
+    vwap = []
+    for b in S:
+        cumv += b["volume"]
+        cumpv += (b["high"] + b["low"] + b["close"]) / 3 * b["volume"]
+        vwap.append(cumpv / cumv if cumv > 0 else b["close"])
+    if cumv <= 0:
+        return None
+    mean = lambda xs: sum(xs) / len(xs)
+    cum_ref = [sum(b["volume"] for b in ps[:i + 1]) for ps in prior if len(ps) > i]
+    bar_ref = [ps[i]["volume"] for ps in prior if len(ps) > i]
+    first_ref = [ps[0]["volume"] for ps in prior]
+    ratio = lambda x, ref: x / mean(ref) if len(ref) >= 3 and mean(ref) > 0 else None
+    trs = []
+    for seq in (prior[-1], S):
+        for k in range(1, len(seq)):
+            trs.append(max(seq[k]["high"] - seq[k]["low"], abs(seq[k]["high"] - seq[k - 1]["close"]),
+                           abs(seq[k]["low"] - seq[k - 1]["close"])))
+    if len(trs) < 8:
+        return None
+    atr = mean(trs[-14:])
+    prev_close = prior[-1][-1]["close"]
+    c = S[-1]["close"]
+    if atr <= 0 or prev_close <= 0 or c <= 0:
+        return None
+    return {"ticker": ticker, "S": S, "i": i, "vwap": vwap, "prev_close": prev_close, "gap": S[0]["open"] / prev_close - 1,
+            "atr": atr, "atr_pct": atr / c, "left": n_total - 1 - i,
+            "rvol_cum": ratio(cumv, cum_ref), "rvol_bar": ratio(S[-1]["volume"], bar_ref), "rvol_first": ratio(S[0]["volume"], first_ref),
+            "turnover": mean([sum(b["close"] * b["volume"] for b in ps) for ps in prior]), "mkt_chg": 0.0}
+
+
+def day_gate(ctx: dict, cfg: dict) -> bool:
+    """Only liquid stocks with a sensible price and a daily swing big enough to trade, but not wild."""
+    t = ctx["ticker"]
+    need = min_turnover(cfg, t) * (1.0 if not market_suffix(t) else 0.4)     # Yahoo reports thinner volume outside the US
+    return (ctx["turnover"] >= need and ctx["S"][-1]["close"] / usd_rate(t) >= 5
+            and 0.0015 <= ctx["atr_pct"] <= 0.03)
+
+
+def _day_level(score: int) -> str:
+    return "STRONG" if score >= 80 else "MODERATE"
+
+
+def day_setup(ctx: dict, cfg: dict, stop: float, why: list[str], score: int) -> dict | None:
+    c = ctx["S"][-1]["close"]
+    if stop >= c:
+        return None
+    risk = c - stop
+    if not 0.0025 <= risk / c <= 0.025:          # too tight to survive normal noise, or too wide to be worth it
+        return None
+    target = c + cfg["day_target_r"] * risk
+    return {"entry": c, "stop": stop, "target": target, "risk_pct": risk / c, "reward_pct": target / c - 1, "why": why,
+            "score": score, "level": _day_level(score), "t": ctx["S"][-1]["t"]}
+
+
+def evaluate_orb(ctx: dict, cfg: dict) -> dict | None:
+    S, i, t = ctx["S"], ctx["i"], ctx["ticker"]
+    if i < 3 or i > 10 or ctx["left"] < 5:
+        return None
+    orh, orl = max(b["high"] for b in S[:2]), min(b["low"] for b in S[:2])
+    b = S[i]
+    c = b["close"]
+    if c <= orh or any(x["close"] > orh for x in S[2:i]) or c - orh > ctx["atr"]:   # must be the first close above, not chased
+        return None
+    if not 0.003 <= (orh - orl) / c <= 0.03 or c <= ctx["vwap"][i]:
+        return None
+    rng = b["high"] - b["low"]
+    avg_v = sum(x["volume"] for x in S[:i]) / i
+    if rng <= 0 or (c - b["low"]) / rng < 0.6 or avg_v <= 0 or b["volume"] < 1.3 * avg_v:
+        return None
+    if (ctx["rvol_cum"] is not None and ctx["rvol_cum"] < 1.0) or not -0.05 <= ctx["gap"] <= 0.08:
+        return None
+    stop = max(orl, c - 2 * ctx["atr"])
+    score = (60 + (10 if b["volume"] >= 2 * avg_v else 0) + (10 if (ctx["rvol_cum"] or 0) >= 1.5 else 0)
+             + (5 if (c - b["low"]) / rng >= 0.8 else 0) + (5 if ctx["mkt_chg"] > 0.003 else 0))
+    why = [f"closed above the high of the first 30 minutes ({fp(t, orh)})",
+           f"above the day's average price (VWAP {fp(t, ctx['vwap'][i])})",
+           f"this candle's volume is {b['volume'] / avg_v:.1f}x the day's average candle"
+           + (f", the day's volume so far is {ctx['rvol_cum']:.1f}x normal" if ctx["rvol_cum"] else "")]
+    return day_setup(ctx, cfg, stop, why, score)
+
+
+def evaluate_vwap(ctx: dict, cfg: dict) -> dict | None:
+    S, i, v, t = ctx["S"], ctx["i"], ctx["vwap"], ctx["ticker"]
+    if i < 4 or ctx["left"] < 5:
+        return None
+    b = S[i]
+    c = b["close"]
+    if not (c > v[i] and S[i - 1]["close"] <= v[i - 1]):                     # a fresh cross back above VWAP
+        return None
+    up = c / ctx["prev_close"] - 1
+    if up < 0.003 or max(S[j]["high"] / v[j] - 1 for j in range(i)) < 0.006:  # up on the day, and clearly strong earlier
+        return None
+    rng = b["high"] - b["low"]
+    avg_v = sum(x["volume"] for x in S[max(0, i - 5):i]) / len(S[max(0, i - 5):i])
+    if rng <= 0 or (c - b["low"]) / rng < 0.5 or avg_v <= 0 or b["volume"] < 1.1 * avg_v:
+        return None
+    stop = min(x["low"] for x in S[max(0, i - 3):i + 1]) * 0.9995
+    score = (60 + (10 if b["volume"] >= 1.8 * avg_v else 0) + (10 if (ctx["rvol_cum"] or 0) >= 1.3 else 0)
+             + (5 if up >= 0.015 else 0) + (5 if ctx["mkt_chg"] > 0.003 else 0))
+    why = [f"up {up:.1%} on the day, was trading well above its average price earlier",
+           f"dipped under the day's average price (VWAP {fp(t, v[i])}) and has just closed back above it",
+           f"this candle's volume is {b['volume'] / avg_v:.1f}x the last few candles"]
+    return day_setup(ctx, cfg, stop, why, score)
+
+
+def evaluate_gapgo(ctx: dict, cfg: dict) -> dict | None:
+    S, i, v, t = ctx["S"], ctx["i"], ctx["vwap"], ctx["ticker"]
+    gap = ctx["gap"]
+    if not 2 <= i <= 8 or ctx["left"] < 5 or not 0.02 <= gap <= 0.12:
+        return None
+    if ctx["rvol_first"] is None or ctx["rvol_first"] < 2.0:                    # the open must have been busy
+        return None
+    pc = ctx["prev_close"]
+    if any(x["close"] < pc * (1 + gap * 0.5) for x in S):                       # the gap must be holding
+        return None
+    b = S[i]
+    c = b["close"]
+    rng = b["high"] - b["low"]
+    if c <= max(x["high"] for x in S[:i]) or c <= v[i] or rng <= 0 or (c - b["low"]) / rng < 0.5:
+        return None
+    stop = min(x["low"] for x in S[max(0, i - 2):i + 1]) * 0.9995
+    score = (60 + (10 if ctx["rvol_first"] >= 3 else 0) + (10 if gap >= 0.04 else 0)
+             + (5 if (c - b["low"]) / rng >= 0.8 else 0) + (5 if ctx["mkt_chg"] > 0.003 else 0))
+    why = [f"gapped up {gap:.1%} at the open and has held the gap",
+           f"the first candle's volume was {ctx['rvol_first']:.1f}x normal",
+           f"now closing at a new high of the day, above VWAP ({fp(t, v[i])})"]
+    return day_setup(ctx, cfg, stop, why, score)
+
+
+DAY_EVAL = {"orb": evaluate_orb, "vwap": evaluate_vwap, "gapgo": evaluate_gapgo}
+
+
+def enabled_day_bots(cfg: dict, db: sqlite3.Connection | None = None) -> list[str]:
+    if not cfg["day_enabled"]:
+        return []
+    off = set()
+    if db is not None:
+        try:
+            off = set(json.loads(meta_get(db, "bots_off", "[]")))
+        except ValueError:
+            pass
+    return [b for b in DAY_BOTS if b in [x.lower() for x in cfg["day_bots"]] and b not in off]
+
+
+def day_universe(cfg: dict, suf: str) -> list[str]:
+    if cfg["day_tickers"]:
+        return [t.upper() for t in cfg["day_tickers"] if market_suffix(t.upper()) == suf]
+    if suf == "":
+        return list(dict.fromkeys(DEFAULT_SCAN + DAY_EXTRA_US.split()))
+    return [f"{t}.{suf}" for t in GLOBAL_SCAN.get(suf, "").split()]
+
+
+def day_markets_open(cfg: dict, now: datetime) -> list[str]:
+    """The enabled day-trading markets that are inside their trading window right now."""
+    if now.weekday() >= 5:
+        return []
+    mins = now.hour * 60 + now.minute
+    want = {m.lower() for m in cfg["day_markets"]}
+    return [m for m, (a, b) in DAY_WINDOWS.items() if m.lower() in want and a <= mins <= b]
+
+
+def bot_names(bots: list[str]) -> str:
+    return " + ".join((DAY_BOTS.get(b) or CRYPTO_BOTS[b])[0] for b in bots if b in DAY_BOTS or b in CRYPTO_BOTS)
+
+
+def format_day_alert(cfg: dict, ticker: str, found: list, e: dict, live: float | None, now_ts: float,
+                     end_ts: float, mkt_line: str) -> str:
+    icon = {"STRONG": "🟢", "MODERATE": "🟡"}
+    names = bot_names([b for b, _ in found])
+    if len(found) == 1:
+        head = f"⚡ {e['level']} day-trade idea: {ticker} ({names})"
+    else:
+        head = f"⚡ STRONG day-trade idea confirmed by {len(found)} bots: {ticker}"
+    age = max(0, round((now_ts - (e["t"] + CANDLE)) / 60))
+    lines = [head]
+    if len(found) > 1:
+        lines.append(f"Buy around {fp(ticker, live or e['entry'])} | candle closed {hm(cfg, e['t'] + CANDLE)} (data about {age} min old)")
+        lines.append(f"Found by {' and '.join(DAY_BOTS[b][0] for b, _ in found)}. When more than one bot agrees, I treat it as stronger.")
+    else:
+        lines.append(f"Buy around {fp(ticker, live or e['entry'])} | candle closed {hm(cfg, e['t'] + CANDLE)} (data about {age} min old)")
+    lines.append(f"Stop-loss {fp(ticker, e['stop'])} ({-e['risk_pct']:.1%}) | Target {fp(ticker, e['target'])} ({e['reward_pct']:+.1%}) "
+                 f"| the target is {cfg['day_target_r']:g}x the risk")
+    lines.append(f"Close it by {hm(cfg, end_ts - cfg['day_close_minutes'] * 60)} even if neither level is hit "
+                 f"(the market closes {hm(cfg, end_ts)}).")
+    why = [f"{DAY_BOTS[b][0]}: {'; '.join(x['why'])}" for b, x in found] if len(found) > 1 else e["why"]
+    lines.append(("Why:\n  " + "\n  ".join(why)) if len(found) > 1 else "Why: " + "; ".join(why))
+    if mkt_line:
+        lines.append(mkt_line)
+    lines.append("Put the stop and the target in as orders with your broker right away. My alerts can arrive minutes late, "
+                 "and day trades move fast.")
+    return "\n".join(lines)
+
+
+def day_verify(ticker: str, e: dict, live: float | None, cfg: dict) -> tuple[list[str], bool]:
+    """Check Bot for day trades: has the price already run, and is there negative news?"""
+    lines, ok = [], True
+    if live:
+        if live <= e["stop"] or live >= e["entry"] + 0.5 * (e["target"] - e["entry"]):
+            lines.append(f"⚠️ The live price ({fp(ticker, live)}) has already moved a long way from the signal "
+                         f"({fp(ticker, e['entry'])}). Don't chase it.")
+            ok = False
+        else:
+            lines.append(f"✔ Live price {fp(ticker, live)} is still close to the signal ({fp(ticker, e['entry'])}).")
+    else:
+        lines.append("Couldn't double-check the live price right now.")
+    try:
+        news = fetch_news(ticker, ticker, cfg["news_hours"])
+        if news["label"] == "negative" and news["neg"] - news["pos"] >= 2:
+            bad = [t for t, sc in news["items"] if sc < 0][:2]
+            lines.append("⚠️ Recent news looks negative: " + "; ".join(t[:90] for t in bad))
+            ok = False
+        else:
+            lines.append("✔ No clearly negative news in the last %d hours." % cfg["news_hours"])
+    except Exception:
+        lines.append("Couldn't check the news right now.")
+    return lines, ok
+
+
+def open_day_trade(db: sqlite3.Connection, cfg: dict, ticker: str, entry: float, e: dict, bots: list[str],
+                   exit_by_ts: float, now_ts: float) -> float:
+    shares = round(cfg["position_usd"] * usd_rate(ticker) / entry, 4)
+    db.execute("INSERT INTO positions (ticker, company, shares, entry_price, entry_at, peak, last_price, manual, bot, kind, stop, "
+               "target, exit_by, mgmt_t) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'day', ?, ?, ?, ?)",
+               (ticker, ticker, shares, entry, datetime.fromtimestamp(now_ts, timezone.utc).isoformat(timespec="seconds"), entry, entry,
+                "+".join(bots), e["stop"], e["target"],
+                datetime.fromtimestamp(exit_by_ts, timezone.utc).isoformat(timespec="seconds"), int(now_ts // CANDLE * CANDLE)))
+    db.commit()
+    return shares
+
+
+def day_totals(db: sqlite3.Connection, since: str = "", kind: str = "day") -> dict:
+    r = db.execute("SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0) FROM positions "
+                   "WHERE status='closed' AND kind=? AND exit_at>=?", (kind, since)).fetchone()
+    return {"n": r[0], "wins": int(r[1]), "pnl": float(r[2])}
+
+
+def format_day_closed(cfg: dict, db: sqlite3.Connection, pos: dict, price: float, reason: str, pnl: float, ret: float,
+                      exit_ts: float) -> str:
+    icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+    t = pos["ticker"]
+    entry_ts = datetime.fromisoformat(pos["entry_at"]).timestamp()
+    mins = max(0, round((exit_ts - entry_ts) / 60))
+    today = datetime.fromtimestamp(exit_ts, timezone.utc).strftime("%Y-%m-%d")
+    kind = pos.get("kind") or "day"
+    label = "Crypto trade" if kind == "crypto" else "Day trade"
+    td, al = day_totals(db, today, kind), day_totals(db, "", kind)
+    return "\n".join([
+        f"{icon} {label} closed: {t} ({bot_names(pos['bot'].split('+'))}) {ret:+.1%}",
+        f"Reason: {reason}",
+        f"Bought ~{fp(t, pos['entry_price'])} at {hm(cfg, entry_ts)}, sold ~{fp(t, price)} at {hm(cfg, exit_ts)} ({mins} min)",
+        f"{icon} {'PROFIT' if pnl >= 0 else 'LOSS'}: {money(pnl)} ({ret:+.2%}) on a simulated ${cfg['position_usd']:,} trade",
+        f"{label}s today: {td['n']} closed, {td['wins']} winner{'s' if td['wins'] != 1 else ''}, net {money(td['pnl'])}",
+        f"All {label.lower()}s so far: {al['n']} closed, {al['wins']} winner{'s' if al['wins'] != 1 else ''}, net {money(al['pnl'])}",
+        "Bought it for real and it's still open? Sell it now.",
+        "Simulated: ignores fees, spreads and real-world fills. Not financial advice.",
+    ])
+
+
+def manage_day_trades(cfg: dict, db: sqlite3.Connection, notify, fetch=None, ts: float | None = None) -> int:
+    """Follow every open day trade: stop, target, and closing before the market closes. Candles are checked in order
+    (the stop first if one candle touched both), and the live price catches moves between candles."""
+    fetch = fetch or fetch_intraday
+    ts = utc_now().timestamp() if ts is None else ts
+    closed = 0
+    for pos in open_positions(db):
+        if pos.get("kind") != "day" or pos["manual"]:
+            continue
+        try:
+            data = fetch(pos["ticker"], "5d")
+        except Exception:
+            continue
+        stop, target = pos["stop"], pos["target"]
+        exit_by = datetime.fromisoformat(pos["exit_by"]).timestamp()
+        bars = [b for ss in data["sessions"] for b in ss if b["t"] > (pos["mgmt_t"] or 0) and b["t"] + CANDLE <= ts]
+        done = None
+        for b in bars:
+            if b["low"] <= stop:
+                done = (min(b["open"], stop), "stop-loss hit", b["t"] + CANDLE)
+            elif b["high"] >= target:
+                done = (max(b["open"], target), "profit target reached", b["t"] + CANDLE)
+            elif b["t"] + CANDLE >= exit_by:
+                done = (b["close"], "closing before the market closes (day trades are not held overnight)", b["t"] + CANDLE)
+            if done:
+                break
+        live = data.get("live")
+        if not done:
+            now_px = live or (bars[-1]["close"] if bars else None)
+            if now_px:
+                if ts >= exit_by:
+                    done = (now_px, "closing before the market closes (day trades are not held overnight)", ts)
+                elif live and live <= stop:
+                    done = (live, "stop-loss hit (live price)", ts)
+                elif live and live >= target:
+                    done = (live, "profit target reached (live price)", ts)
+        if done:
+            price, reason, exit_ts = done
+            pnl, ret = close_position(db, pos, price, reason)
+            db.execute("UPDATE positions SET exit_at=? WHERE id=?",
+                       (datetime.fromtimestamp(min(exit_ts, ts), timezone.utc).isoformat(timespec="seconds"), pos["id"]))
+            db.commit()
+            notify(format_day_closed(cfg, db, pos, price, reason, pnl, ret, min(exit_ts, ts)))
+            closed += 1
+        else:
+            last = live or (bars[-1]["close"] if bars else pos["last_price"])
+            db.execute("UPDATE positions SET last_price=?, peak=?, mgmt_t=? WHERE id=?",
+                       (last, max(pos["peak"] or 0, last or 0), max([pos["mgmt_t"] or 0] + [b["t"] for b in bars]), pos["id"]))
+            db.commit()
+    return closed
+
+
+def scan_day_market(cfg: dict, db: sqlite3.Connection, notify, market: str, expected: int, ts: float, fetch=None) -> int | None:
+    """Look at one market's stocks after a new 15-minute candle closed. Returns the number of alerts, or None
+    if the market isn't trading right now (or its data is late), so the next run should try again."""
+    fetch = fetch or fetch_intraday
+    suf = SUFFIX_OF[market]
+    index = MARKETS[suf][1]
+    info = json.loads(meta_get(db, "day_info", "{}") or "{}")
+    state = None
+    if index:                                            # the market's own index first: one request tells if it is open
+        try:
+            idata = fetch(index)
+            today = int(ts + idata["off"]) // 86400
+            if not idata["days"] or idata["days"][-1] != today or len(idata["sessions"]) < 2:
+                return None
+            IS = [b for b in idata["sessions"][-1] if b["t"] + CANDLE <= ts]
+            if not IS or IS[-1]["t"] < expected - CANDLE:
+                return None
+            state = idx_state(idata["sessions"][-2][-1]["close"], IS)
+        except Exception as ex:
+            log(f"day: no {market} index data ({str(ex)[:60]}), checking its stocks without a market filter")
+    bots = enabled_day_bots(cfg, db)
+    info[market] = {"state": "unknown" if state is None else "up" if state["ok"] else "down", "at": int(ts),
+                    "chg_open": round(state["chg_open"], 4) if state else 0.0}
+    meta_set(db, "day_info", json.dumps(info))
+    if not bots:
+        return 0
+    if state is not None and not state["ok"]:
+        log(f"day: {market} is weak today ({state['chg_open']:+.2%} from its open), day-trade ideas paused")
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+    tickers = day_universe(cfg, suf)
+
+    def grab(t):
+        try:
+            return t, fetch(t)
+        except Exception:
+            return t, None
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        got = dict(ex.map(grab, tickers))
+    day_key = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+    evaluated = {k: v for k, v in json.loads(meta_get(db, "day_evaluated", "{}") or "{}").items() if v > ts - 2 * 86400}
+    sent_map = {k: v for k, v in json.loads(meta_get(db, "day_sent", "{}") or "{}").items() if k.startswith(day_key)}
+    held = {p["ticker"] for p in open_positions(db)}
+    hits, failed, stale, fresh = [], 0, 0, 0
+    for t in tickers:
+        data = got.get(t)
+        if not data or not data["sessions"]:
+            failed += 1
+            continue
+        if data["days"][-1] != int(ts + data["off"]) // 86400:
+            stale += 1
+            continue
+        S = [b for b in data["sessions"][-1] if b["t"] + CANDLE <= ts]
+        if not S or S[-1]["t"] < expected - CANDLE:
+            stale += 1
+            continue
+        fresh += 1
+        if evaluated.get(t, 0) >= S[-1]["t"]:
+            continue
+        evaluated[t] = S[-1]["t"]
+        if t in held:
+            continue
+        ctx = day_ctx(data["sessions"][:-1], S, session_len(data), t)
+        if not ctx or not day_gate(ctx, cfg):
+            continue
+        if state is not None:
+            ctx["mkt_chg"] = state["chg_open"]
+        done = sent_map.get(f"{day_key}:{t}", [])
+        found = [(b, e) for b in bots if b not in done and (e := DAY_EVAL[b](ctx, cfg))]
+        if found:
+            found.sort(key=lambda x: -x[1]["score"])
+            hits.append((t, found, data, S))
+    log(f"day: {market}: {len(tickers)} stocks, {failed} unavailable, {stale} not trading or late, {len(hits)} setup(s) found")
+    if len(tickers) >= 3 and failed >= max(3, int(0.8 * len(tickers))) and meta_get(db, "day_fail_" + market) != day_key:
+        meta_set(db, "day_fail_" + market, day_key)
+        notify(f"⚠️ I couldn't get 15-minute prices for {market} stocks just now ({failed} of {len(tickers)} failed). "
+               "The price source (Yahoo) may be blocking GitHub's servers or having a bad moment. "
+               "Day-trade alerts for this market won't work until that clears. I'll keep trying and won't repeat this today.")
+    hits.sort(key=lambda h: (-len(h[1]), -h[1][0][1]["score"]))
+    count_key = "day_count_" + day_key
+    sent = 0
+    for t, found, data, S in hits:
+        if sent >= cfg["day_max_alerts_per_run"] or int(meta_get(db, count_key, "0") or 0) >= cfg["day_max_alerts_per_day"]:
+            break
+        e = found[0][1]
+        live = data.get("live")
+        end_ts = session_end(data, data["sessions"][-1][0]["t"])
+        exit_by = end_ts - cfg["day_close_minutes"] * 60
+        if ts >= exit_by - 600:
+            continue
+        done = sent_map.get(f"{day_key}:{t}", [])
+        if live and (live <= e["stop"] or live >= e["entry"] + 0.5 * (e["target"] - e["entry"])):
+            log(f"day: skipped {t}, the price already moved")           # too late to buy it at a sensible price
+            sent_map[f"{day_key}:{t}"] = done + [b for b, _ in found]
+            continue
+        mkt_line = (f"Market: the {market} index is {state['chg_open']:+.1%} since the open." if state else "")
+        msg = format_day_alert(cfg, t, found, e, live, ts, end_ts, mkt_line)
+        checks, ok = day_verify(t, e, live, cfg)
+        bump(db, "check_ideas")
+        if not ok:
+            bump(db, "check_flagged")
+        msg += "\nCheck Bot (second look):\n  " + "\n  ".join(checks)
+        if not ok:
+            head, _, rest = msg.partition("\n")
+            msg = re.sub(r"^\S+ (STRONG|MODERATE|WEAK)", "⚠️ CAUTION", head) + "\n" + rest
+            msg += "\nI'd skip this one, so I'm not tracking a trade for it."
+        elif cfg["auto_track"]:
+            entry = live or e["entry"]
+            shares = open_day_trade(db, cfg, t, entry, e, [b for b, _ in found], exit_by, ts)
+            msg += (f"\nTracking a ${cfg['position_usd']:,} simulated day trade ({shares:g} shares at ~{fp(t, entry)}). "
+                    f"I'll send a message when it hits the stop or the target, or when it's time to close it, with the % result.")
+        else:
+            msg += "\nI only track day trades when AUTO_TRACK is on, so there will be no result message for this one."
+        msg += "\nNot financial advice. Day trading is risky: fees and delays can wipe out small gains."
+        notify(msg)
+        sent_map[f"{day_key}:{t}"] = done + [b for b, _ in found]
+        bump(db, count_key)
+        sent += 1
+    meta_set(db, "day_evaluated", json.dumps(evaluated))
+    meta_set(db, "day_sent", json.dumps(sent_map))
+    db.execute("DELETE FROM meta WHERE k LIKE 'day_count_%' AND k<>?", (count_key,))
+    db.commit()
+    return sent if fresh >= max(1, (len(tickers) - failed) // 2) else None
+
+
+def maybe_day(cfg: dict, db: sqlite3.Connection, notify, fetch=None, now: datetime | None = None) -> int:
+    """Called on every cloud run (about every 5 minutes): follow open day trades, then, whenever a new 15-minute
+    candle has closed, look at the markets that are open."""
+    if not cfg["day_enabled"]:
+        return 0
+    now = now or utc_now()
+    ts = now.timestamp()
+    sent = 0
+    try:
+        log(f"day trades checked, {manage_day_trades(cfg, db, notify, fetch, ts)} closed")
+    except Exception as e:
+        log(f"day trade check failed: {type(e).__name__}: {e}")
+    expected = int(ts - CANDLE) // CANDLE * CANDLE          # start of the newest finished candle
+    for market in day_markets_open(cfg, now):
+        key = "day_bar_" + market
+        if int(meta_get(db, key, "0") or 0) >= expected:
+            continue
+        try:
+            n = scan_day_market(cfg, db, notify, market, expected, ts, fetch)
+        except Exception as e:
+            log(f"day: {market} scan failed: {type(e).__name__}: {e}")
+            continue
+        if n is not None:
+            meta_set(db, key, expected)
+            sent += n
+    return sent
+
+
+def day_text(cfg: dict, db: sqlite3.Connection) -> str:
+    opens = [p for p in open_positions(db) if p.get("kind") == "day"]
+    today = utc_now().strftime("%Y-%m-%d")
+    td, al = day_totals(db, today), day_totals(db)
+    lines = [f"Day trading is {'on' if cfg['day_enabled'] else 'off'} for: {', '.join(cfg['day_markets'])}.",
+             "Bots: " + ", ".join(f"{DAY_BOTS[b][0]} ({'on' if b in enabled_day_bots(cfg, db) else 'off'})" for b in DAY_BOTS)]
+    if opens:
+        lines.append("Open day trades:")
+        for p in opens:
+            px = p["last_price"] or p["entry_price"]
+            lines.append(f"  {p['ticker']:8} in {fp(p['ticker'], p['entry_price'])}, now {fp(p['ticker'], px)} ({px / p['entry_price'] - 1:+.1%}), "
+                         f"stop {fp(p['ticker'], p['stop'])}, target {fp(p['ticker'], p['target'])}, "
+                         f"close by {hm(cfg, datetime.fromisoformat(p['exit_by']).timestamp())}")
+    else:
+        lines.append("No open day trades.")
+    lines.append(f"Today: {td['n']} closed, {td['wins']} winners, net {money(td['pnl'])}")
+    lines.append(f"All day trades: {al['n']} closed, {al['wins']} winners, net {money(al['pnl'])}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Day-trading backtest: replay the three day bots on the last ~2 months of 15-minute candles
+# --------------------------------------------------------------------------- #
+def sim_day_trade(S: list[dict], i: int, delay: int, stop: float, target: float):
+    """Enter at the open of the candle `delay` candles after the signal candle i, then follow the stop/target.
+    The last exit is the close of the second-to-last candle (about 15-30 minutes before the market closes).
+    Returns (return, reason, exit candle index) or None if the trade could not be taken."""
+    j0, last = i + delay, len(S) - 2
+    if j0 > last:
+        return None
+    entry = S[j0]["open"]
+    if entry <= stop or entry >= target:
+        return None                                           # the price had already run or broken the stop
+    for j in range(j0, last + 1):
+        b = S[j]
+        if b["low"] <= stop:
+            return min(b["open"], stop) / entry - 1, "stop-loss", j
+        if b["high"] >= target:
+            return max(b["open"], target) / entry - 1, "profit target", j
+    return S[last]["close"] / entry - 1, "end of day", last
+
+
+def cmd_backtest_day(cfg: dict, stocks: int = 60, market: str = "US", cost_pct: float = 0.10, delays: list[int] | None = None) -> None:
+    import random
+    delays = delays or [1, 2]
+    cost = cost_pct / 100
+    wanted = [m for m in DAY_WINDOWS if market.lower() in ("all", m.lower())]
+    if not wanted:
+        sys.exit("Day-trading backtests support: " + ", ".join(DAY_WINDOWS) + ", or all.")
+    bots = list(DAY_BOTS)
+    R = cfg["day_target_r"]
+    all_stats = {d: {b: [] for b in bots} for d in delays}
+    base_stats = {d: {b: [] for b in bots} for d in delays}
+    ends = {d: {b: {"stop-loss": 0, "profit target": 0, "end of day": 0} for b in bots} for d in delays}
+    n_stocks, days_seen, failed = 0, set(), []
+    for m in wanted:
+        suf = SUFFIX_OF[m]
+        index = MARKETS[suf][1]
+        idx_by_day = {}
+        if index:
+            try:
+                idata = fetch_intraday(index, "59d")
+                for k, ss in enumerate(idata["sessions"][1:], 1):
+                    idx_by_day[idata["days"][k]] = (idata["sessions"][k - 1][-1]["close"], {b["t"]: b for b in ss}, ss[0]["open"])
+            except Exception:
+                print(f"  (no {m} index data: tested without a market filter)", flush=True)
+        universe = day_universe(cfg, suf)[:max(5, stocks)]
+        for n, t in enumerate(universe, 1):
+            try:
+                time.sleep(0.3)
+                data = fetch_intraday(t, "59d")
+            except Exception as e:
+                failed.append(t)
+                print(f"  [{m} {n}/{len(universe)}] {t}: skipped ({str(e)[:50]})", flush=True)
+                continue
+            ss, ds = data["sessions"], data["days"]
+            n_total = max(len(s) for s in ss)
+            n_stocks += 1
+            print(f"  [{m} {n}/{len(universe)}] {t}: {len(ss)} days", flush=True)
+            for s in range(3, len(ss)):
+                S, prior = ss[s], ss[max(0, s - 8):s]
+                if len(S) < n_total - 3:
+                    continue                                   # a half day (holiday); skip
+                days_seen.add(ds[s])
+                taken = {}
+                free_at = -1
+                for i in range(len(S)):
+                    if i <= free_at:
+                        continue
+                    ctx = day_ctx(prior, S[:i + 1], n_total, t)
+                    if not ctx or not day_gate(ctx, cfg):
+                        continue
+                    ix = idx_by_day.get(ds[s])
+                    if ix and S[i]["t"] in ix[1]:
+                        c = ix[1][S[i]["t"]]["close"]
+                        if not (c / ix[2] - 1 > -0.0025 and c / ix[0] - 1 > -0.01):
+                            continue
+                        ctx["mkt_chg"] = c / ix[2] - 1
+                    for bot in bots:
+                        if bot in taken:
+                            continue
+                        e = DAY_EVAL[bot](ctx, cfg)
+                        if not e:
+                            continue
+                        taken[bot] = True
+                        rng = random.Random(f"{t}{ds[s]}{bot}")
+                        first = None
+                        for d in delays:
+                            r = sim_day_trade(S, i, d, e["stop"], e["target"])
+                            if r is None:
+                                continue
+                            first = first or r
+                            all_stats[d][bot].append(r[0] - cost)
+                            ends[d][bot][r[1]] += 1
+                            lo, hi = 3, len(S) - 7              # random-time entry with the same stop and target distances
+                            if hi > lo:
+                                k = rng.randint(lo, hi)
+                                ent = S[k + d]["open"]
+                                rb = sim_day_trade(S, k, d, ent * (1 - e["risk_pct"]), ent * (1 + e["risk_pct"] * R))
+                                if rb:
+                                    base_stats[d][bot].append(rb[0] - cost)
+                        if first:
+                            free_at = max(free_at, first[2])      # one trade at a time per stock
+    if n_stocks < 5:
+        sys.exit("Could not download enough 15-minute data to run the backtest. Yahoo only keeps about 2 months of it; try again later.")
+    pc = lambda x: f"{x:+.2%}"
+    print(f"\nDAY-TRADING SUMMARY: {', '.join(wanted)}, {n_stocks} stocks, {len(days_seen)} trading days, costs {cost:.2%} per trade")
+    print(f"Rules: signal on a finished 15-minute candle; you buy {delays[0]} candle(s) later at that candle's open"
+          f" (second table: {delays[-1]}); stop at the bot's stop, target {R:g}x the risk; closed ~15-30 min before the close.\n")
+    for d in delays:
+        label = f"If you act {d} candle(s) after the signal (about {d * 15 - 10}-{d * 15 + 5} min of delay)"
+        print(label)
+        print(f"{'Bot':18} {'Trades':>7} {'Win rate':>9} {'Avg trade':>10} {'Random time':>12}   Verdict")
+        for b in bots:
+            st, bs = trade_stats(all_stats[d][b]), trade_stats(base_stats[d][b])
+            if not st["n"]:
+                print(f"{DAY_BOTS[b][0]:18} {0:>7} {'':>9} {'':>10} {'':>12}   no trades (rules never matched)")
+                continue
+            base = bs["avg"] if bs.get("n") else 0.0
+            verdict = ("too few trades to judge" if st["n"] < 30 else
+                       "beat random timing: worth keeping on" if st["avg"] > 0.0005 and st["avg"] > base + 0.001 else
+                       "profitable, but no better than random timing" if st["avg"] > 0 else
+                       "lost money: turn it off")
+            print(f"{DAY_BOTS[b][0]:18} {st['n']:>7} {st['win']:>9.0%} {pc(st['avg']):>10} {pc(base):>12}   {verdict}")
+        print()
+    d0 = delays[0]
+    print(f"How the trades ended (delay {d0}): " + "; ".join(
+        f"{DAY_BOTS[b][0]}: " + ", ".join(f"{k} {v / max(1, sum(ends[d0][b].values())):.0%}" for k, v in ends[d0][b].items()) for b in bots))
+    print("\nHOW TO READ THIS")
+    print(" * 'Random time' = the same stop and target distances, but entering at a random time that day. A bot only helps if its")
+    print("   average trade is clearly above that.")
+    print(" * Yahoo keeps only about 2 months of 15-minute candles, and that is one market mood. Few trades means luck can decide;")
+    print("   wait for 30+ trades per bot, and judge again as time passes. Today's biggest stocks make old results look better (survivorship bias).")
+    print(" * Compare the two tables: the more your delay costs, the less this works for you. Fees, spreads and slippage are only")
+    print("   roughly covered by the cost setting; small accounts feel them most.")
+    if failed:
+        print(f"\n(Skipped, no data: {', '.join(failed)})")
+
+
+# --------------------------------------------------------------------------- #
+# Crypto day trading: Binance 15-minute candles (public price data, no key needed). Crypto never closes,
+# so there is no opening range; trades get a stop, a target and a time limit instead.
+# --------------------------------------------------------------------------- #
+CRYPTO_BOTS = {
+    "cbreak": ("Crypto Breakout Bot", "Coins that close above their 24-hour high on heavy volume while Bitcoin is calm or rising."),
+    "cvwap": ("Crypto VWAP Bot", "Coins in a short-term uptrend that dipped under their 24-hour average price (VWAP) and climbed back above it."),
+    "cdip": ("Crypto Dip Bot", "Coins in an uptrend that were sold off hard (very low RSI) and have just started to bounce."),
+}
+CRYPTO_COINS = ("BTC ETH BNB SOL XRP DOGE ADA AVAX LINK DOT TRX LTC BCH ATOM NEAR APT ARB OP INJ SUI TON UNI AAVE FIL ETC HBAR XLM")
+BINANCE_HOSTS = ["https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com"]
+_BINANCE_HOST = [None]
+
+
+def parse_klines(rows: list) -> list[dict]:
+    out = []
+    for r in rows:
+        try:
+            out.append({"t": int(r[0]) // 1000, "open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4]),
+                        "volume": float(r[5]), "qvol": float(r[7])})
+        except (ValueError, IndexError, TypeError):
+            continue
+    out.sort(key=lambda b: b["t"])
+    return out
+
+
+def fetch_klines(symbol: str, limit: int = 300, end_ms: int | None = None, interval: str = "15m") -> list[dict]:
+    """Candles (oldest first) from Binance's public market-data servers. The last one may still be running."""
+    qs = f"symbol={symbol}&interval={interval}&limit={limit}" + (f"&endTime={end_ms}" if end_ms else "")
+    hosts = ([_BINANCE_HOST[0]] if _BINANCE_HOST[0] else []) + [h for h in BINANCE_HOSTS if h != _BINANCE_HOST[0]]
+    last = None
+    for host in hosts:
+        try:
+            rows = json.loads(http_get(f"{host}/api/v3/klines?{qs}", BROWSER_UA, timeout=15, retries=1))
+            if isinstance(rows, dict):
+                raise RuntimeError(str(rows.get("msg", "error"))[:60])
+            _BINANCE_HOST[0] = host
+            return parse_klines(rows)
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"Binance prices not reachable ({str(last)[:60]})")
+
+
+def crypto_symbols(cfg: dict) -> list[str]:
+    coins = cfg["crypto_coins"] or CRYPTO_COINS.split()
+    return [f"{c.upper()}{cfg['crypto_quote']}" for c in coins]
+
+
+def coin_of(symbol: str, cfg: dict | None = None) -> str:
+    for q in ((cfg or {}).get("crypto_quote"), "USDT", "USDC"):
+        if q and symbol.endswith(q):
+            return symbol[:-len(q)]
+    return symbol
+
+
+def ema_list(vals: list[float], n: int) -> list[float]:
+    k, out, e = 2 / (n + 1), [], vals[0]
+    for v in vals:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def crypto_ctx(bars: list[dict], symbol: str = "") -> dict | None:
+    """Numbers the crypto bots look at, from finished candles (oldest first, the last is the one being judged)."""
+    if len(bars) < 200:
+        return None
+    c = bars[-1]["close"]
+    closes = [b["close"] for b in bars]
+    win = bars[-96:]
+    vol24 = sum(b["volume"] for b in win)
+    if vol24 <= 0 or c <= 0:
+        return None
+    vwap_at = lambda k: (lambda w: sum((b["high"] + b["low"] + b["close"]) / 3 * b["volume"] for b in w) / max(1e-12, sum(b["volume"] for b in w)))(bars[k - 95:k + 1])
+    trs = [max(bars[k]["high"] - bars[k]["low"], abs(bars[k]["high"] - bars[k - 1]["close"]), abs(bars[k]["low"] - bars[k - 1]["close"]))
+           for k in range(len(bars) - 14, len(bars))]
+    atr = sum(trs) / 14
+    if atr <= 0:
+        return None
+    r = rsi_series(closes[-80:])
+    e20, e50, e192 = ema_list(closes, 20), ema_list(closes, 50), ema_list(closes, 192)
+    n = len(bars)
+    return {"symbol": symbol, "S": bars, "c": c, "atr": atr, "atr_pct": atr / c,
+            "vwap": vwap_at(n - 1), "vwap_prev": vwap_at(n - 2),
+            "high24": max(b["high"] for b in bars[-97:-1]), "high24_prev": max(b["high"] for b in bars[-98:-2]),
+            "vol_ratio": bars[-1]["volume"] / max(1e-12, sum(b["volume"] for b in bars[-21:-1]) / 20),
+            "vol5": sum(b["volume"] for b in bars[-6:-1]) / 5,
+            "ema20": e20[-1], "ema50": e50[-1], "ema192": e192[-1], "ema192_prev": e192[-25],
+            "rsi": r[-1], "rsi_min6": min(x for x in r[-7:-1] if x is not None) if any(x is not None for x in r[-7:-1]) else None,
+            "chg24": c / bars[-97]["close"] - 1, "qvol24": sum(b["qvol"] for b in win), "mkt_chg": 0.0}
+
+
+def crypto_gate(ctx: dict, cfg: dict) -> bool:
+    return ctx["qvol24"] >= cfg["crypto_min_volume_usd"] and 0.001 <= ctx["atr_pct"] <= 0.02
+
+
+def crypto_setup(ctx: dict, cfg: dict, stop: float, why: list[str], score: int) -> dict | None:
+    c = ctx["c"]
+    if stop >= c:
+        return None
+    risk = c - stop
+    if not 0.004 <= risk / c <= 0.03:
+        return None
+    target = c + cfg["day_target_r"] * risk
+    return {"entry": c, "stop": stop, "target": target, "risk_pct": risk / c, "reward_pct": target / c - 1, "why": why,
+            "score": score, "level": _day_level(score), "t": ctx["S"][-1]["t"]}
+
+
+def evaluate_cbreak(ctx: dict, cfg: dict) -> dict | None:
+    S, c, sym = ctx["S"], ctx["c"], ctx["symbol"]
+    b = S[-1]
+    rng = b["high"] - b["low"]
+    if c <= ctx["high24"] or S[-2]["close"] > ctx["high24_prev"] or c - ctx["high24"] > ctx["atr"]:     # a fresh break, not chased
+        return None
+    if ctx["vol_ratio"] < 2.0 or rng <= 0 or (c - b["low"]) / rng < 0.6 or c <= ctx["vwap"] or c <= ctx["ema50"]:
+        return None
+    stop = min(x["low"] for x in S[-2:]) - 0.1 * ctx["atr"]
+    score = (60 + (10 if ctx["vol_ratio"] >= 3 else 0) + (10 if c > ctx["ema192"] else 0) + (5 if (c - b["low"]) / rng >= 0.8 else 0)
+             + (5 if ctx["mkt_chg"] > 0.003 else 0))
+    why = [f"closed above its highest price of the last 24 hours ({fp(sym, ctx['high24'])})",
+           f"this candle's volume is {ctx['vol_ratio']:.1f}x the recent average", f"above its 24-hour average price (VWAP {fp(sym, ctx['vwap'])})"]
+    return crypto_setup(ctx, cfg, stop, why, score)
+
+
+def evaluate_cvwap(ctx: dict, cfg: dict) -> dict | None:
+    S, c, sym = ctx["S"], ctx["c"], ctx["symbol"]
+    b = S[-1]
+    rng = b["high"] - b["low"]
+    if not (c > ctx["vwap"] and S[-2]["close"] <= ctx["vwap_prev"]):
+        return None
+    if not (ctx["ema20"] > ctx["ema50"] and c > ctx["ema50"] and ctx["chg24"] > 0):
+        return None
+    if rng <= 0 or (c - b["low"]) / rng < 0.5 or b["volume"] < 1.2 * ctx["vol5"]:
+        return None
+    stop = min(x["low"] for x in S[-4:]) * 0.9995
+    score = (60 + (10 if b["volume"] >= 2 * ctx["vol5"] else 0) + (10 if ctx["chg24"] >= 0.03 else 0)
+             + (5 if (c - b["low"]) / rng >= 0.8 else 0) + (5 if ctx["mkt_chg"] > 0.003 else 0))
+    why = [f"in an uptrend (up {ctx['chg24']:.1%} in 24 hours, 20-period average above the 50)",
+           f"dipped under its 24-hour average price (VWAP {fp(sym, ctx['vwap'])}) and has just closed back above it",
+           f"this candle's volume is {b['volume'] / ctx['vol5']:.1f}x the last few candles"]
+    return crypto_setup(ctx, cfg, stop, why, score)
+
+
+def evaluate_cdip(ctx: dict, cfg: dict) -> dict | None:
+    S, c, sym = ctx["S"], ctx["c"], ctx["symbol"]
+    b = S[-1]
+    if ctx["rsi"] is None or ctx["rsi_min6"] is None:
+        return None
+    if not (ctx["rsi_min6"] <= 28 and ctx["rsi"] >= ctx["rsi_min6"] + 6 and ctx["rsi"] < 50):
+        return None
+    if not (c > ctx["ema192"] * 0.985 and ctx["ema192"] > ctx["ema192_prev"]):                           # the bigger trend is still up
+        return None
+    if not (c > b["open"] and c > S[-2]["close"] and b["volume"] >= ctx["vol5"]):
+        return None
+    stop = min(x["low"] for x in S[-6:]) * 0.9995
+    score = 60 + (10 if ctx["rsi_min6"] <= 22 else 0) + (10 if b["volume"] >= 1.5 * ctx["vol5"] else 0) + (5 if c > ctx["ema20"] else 0) + (5 if ctx["mkt_chg"] > 0 else 0)
+    why = [f"sold off hard (RSI fell to {ctx['rsi_min6']:.0f}) inside a rising 2-day trend", f"now bouncing (RSI {ctx['rsi']:.0f}) on a green candle with more volume"]
+    return crypto_setup(ctx, cfg, stop, why, score)
+
+
+CRYPTO_EVAL = {"cbreak": evaluate_cbreak, "cvwap": evaluate_cvwap, "cdip": evaluate_cdip}
+
+
+def btc_state(bars: list[dict]) -> dict:
+    """Bitcoin sets the mood for every coin: no new ideas if it fell more than 1.5% in 4 hours or 1% in 1 hour."""
+    c = bars[-1]["close"]
+    c4, c1 = c / bars[-17]["close"] - 1, c / bars[-5]["close"] - 1
+    return {"ok": c4 > -0.015 and c1 > -0.01, "chg4h": c4, "chg1h": c1}
+
+
+def enabled_crypto_bots(cfg: dict, db: sqlite3.Connection | None = None) -> list[str]:
+    if not cfg["crypto_enabled"]:
+        return []
+    off = set()
+    if db is not None:
+        try:
+            off = set(json.loads(meta_get(db, "bots_off", "[]")))
+        except ValueError:
+            pass
+    return [b for b in CRYPTO_BOTS if b in [x.lower() for x in cfg["crypto_bots"]] and b not in off]
+
+
+def crypto_hours_open(cfg: dict, ts: float) -> bool:
+    """New ideas only between your chosen local hours (default 7-23), so they don't wake you up."""
+    try:
+        a, b = [int(x) for x in str(cfg["crypto_hours"]).split("-")]
+    except ValueError:
+        return True
+    h = datetime.fromtimestamp(ts, tz_of(cfg)).hour + datetime.fromtimestamp(ts, tz_of(cfg)).minute / 60
+    return a <= h < b
+
+
+def format_crypto_alert(cfg: dict, symbol: str, found: list, e: dict, live: float | None, now_ts: float, hold_ts: float, mkt_line: str) -> str:
+    coin = coin_of(symbol, cfg)
+    names = bot_names([b for b, _ in found])
+    head = (f"⚡ {e['level']} crypto day-trade idea: {coin} ({names})" if len(found) == 1
+            else f"⚡ STRONG crypto day-trade idea confirmed by {len(found)} bots: {coin}")
+    age = max(0, round((now_ts - (e["t"] + CANDLE)) / 60))
+    lines = [head, f"Buy around {fp(symbol, live or e['entry'])} ({symbol}) | candle closed {hm(cfg, e['t'] + CANDLE)} (data about {age} min old)"]
+    if len(found) > 1:
+        lines.append(f"Found by {' and '.join(CRYPTO_BOTS[b][0] for b, _ in found)}. When more than one bot agrees, I treat it as stronger.")
+    lines.append(f"Stop-loss {fp(symbol, e['stop'])} ({-e['risk_pct']:.1%}) | Target {fp(symbol, e['target'])} ({e['reward_pct']:+.1%}) "
+                 f"| the target is {cfg['day_target_r']:g}x the risk")
+    lines.append(f"Close it by {hm(cfg, hold_ts)} even if neither level is hit (crypto never closes, so trades get a "
+                 f"{cfg['crypto_max_hold_hours']:g}-hour limit).")
+    why = [f"{CRYPTO_BOTS[b][0]}: {'; '.join(x['why'])}" for b, x in found] if len(found) > 1 else e["why"]
+    lines.append(("Why:\n  " + "\n  ".join(why)) if len(found) > 1 else "Why: " + "; ".join(why))
+    if mkt_line:
+        lines.append(mkt_line)
+    lines.append(f"On Binance in the EU, USDT pairs aren't available to you: trade {coin}/USDC or {coin}/EUR instead (the price is almost the same).")
+    lines.append("Put the stop and the target in as orders (an OCO order) right away. My alerts can arrive minutes late, and crypto moves fast.")
+    return "\n".join(lines)
+
+
+def open_crypto_trade(db: sqlite3.Connection, cfg: dict, symbol: str, entry: float, e: dict, bots: list[str],
+                      exit_by_ts: float, now_ts: float) -> float:
+    shares = round(cfg["position_usd"] / entry, 8)
+    db.execute("INSERT INTO positions (ticker, company, shares, entry_price, entry_at, peak, last_price, manual, bot, kind, stop, "
+               "target, exit_by, mgmt_t) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'crypto', ?, ?, ?, ?)",
+               (symbol, symbol, shares, entry, datetime.fromtimestamp(now_ts, timezone.utc).isoformat(timespec="seconds"), entry, entry,
+                "+".join(bots), e["stop"], e["target"],
+                datetime.fromtimestamp(exit_by_ts, timezone.utc).isoformat(timespec="seconds"), int(now_ts // CANDLE * CANDLE)))
+    db.commit()
+    return shares
+
+
+def manage_crypto_trades(cfg: dict, db: sqlite3.Connection, notify, fetch=None, ts: float | None = None) -> int:
+    """Follow every open crypto trade: stop, target and the time limit (the same candle-by-candle rules as day trades)."""
+    fetch = fetch or fetch_klines
+    ts = utc_now().timestamp() if ts is None else ts
+    closed = 0
+    for pos in open_positions(db):
+        if pos.get("kind") != "crypto":
+            continue
+        try:
+            allb = fetch(pos["ticker"], 60)
+        except Exception:
+            continue
+        stop, target = pos["stop"], pos["target"]
+        exit_by = datetime.fromisoformat(pos["exit_by"]).timestamp()
+        bars = [b for b in allb if b["t"] > (pos["mgmt_t"] or 0) and b["t"] + CANDLE <= ts]
+        live = allb[-1]["close"] if allb else None
+        done = None
+        for b in bars:
+            if b["low"] <= stop:
+                done = (min(b["open"], stop), "stop-loss hit", b["t"] + CANDLE)
+            elif b["high"] >= target:
+                done = (max(b["open"], target), "profit target reached", b["t"] + CANDLE)
+            elif b["t"] + CANDLE >= exit_by:
+                done = (b["close"], f"time limit ({cfg['crypto_max_hold_hours']:g} hours): time to close it", b["t"] + CANDLE)
+            if done:
+                break
+        if not done and live:
+            if ts >= exit_by:
+                done = (live, f"time limit ({cfg['crypto_max_hold_hours']:g} hours): time to close it", ts)
+            elif live <= stop:
+                done = (live, "stop-loss hit (live price)", ts)
+            elif live >= target:
+                done = (live, "profit target reached (live price)", ts)
+        if done:
+            price, reason, exit_ts = done
+            pnl, ret = close_position(db, pos, price, reason)
+            db.execute("UPDATE positions SET exit_at=? WHERE id=?",
+                       (datetime.fromtimestamp(min(exit_ts, ts), timezone.utc).isoformat(timespec="seconds"), pos["id"]))
+            db.commit()
+            notify(format_day_closed(cfg, db, pos, price, reason, pnl, ret, min(exit_ts, ts)))
+            closed += 1
+        else:
+            last = live or pos["last_price"]
+            db.execute("UPDATE positions SET last_price=?, peak=?, mgmt_t=? WHERE id=?",
+                       (last, max(pos["peak"] or 0, last or 0), max([pos["mgmt_t"] or 0] + [b["t"] for b in bars]), pos["id"]))
+            db.commit()
+    return closed
+
+
+def scan_crypto(cfg: dict, db: sqlite3.Connection, notify, expected: int, ts: float, fetch=None) -> int | None:
+    """Look at every coin after a new 15-minute candle closed. Returns the number of alerts, or None to try again next run."""
+    fetch = fetch or fetch_klines
+    day_key = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+    try:
+        btc = [b for b in fetch(f"BTC{cfg['crypto_quote']}", 300) if b["t"] + CANDLE <= ts]
+        if len(btc) < 200 or btc[-1]["t"] < expected - CANDLE:
+            return None
+        state = btc_state(btc)
+    except Exception as ex:
+        log(f"crypto: no Bitcoin data ({str(ex)[:70]})")
+        if meta_get(db, "crypto_fail") != day_key:
+            meta_set(db, "crypto_fail", day_key)
+            notify("⚠️ I couldn't get Binance prices just now, so crypto ideas are paused. Binance may be blocking GitHub's servers "
+                   "or having a bad moment. I'll keep trying and won't repeat this today.")
+        return None
+    meta_set(db, "crypto_info", json.dumps({"state": "up" if state["ok"] else "down", "at": int(ts), "chg4h": round(state["chg4h"], 4),
+                                            "chg1h": round(state["chg1h"], 4)}))
+    bots = enabled_crypto_bots(cfg, db)
+    if not bots:
+        return 0
+    if not state["ok"]:
+        log(f"crypto: Bitcoin is falling ({state['chg4h']:+.1%} in 4 hours), crypto ideas paused")
+        return 0
+    if not crypto_hours_open(cfg, ts):
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+    symbols = crypto_symbols(cfg)
+
+    def grab(s):
+        try:
+            return s, fetch(s, 300)
+        except Exception:
+            return s, None
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        got = dict(ex.map(grab, symbols))
+    evaluated = {k: v for k, v in json.loads(meta_get(db, "crypto_evaluated", "{}") or "{}").items() if v > ts - 2 * 86400}
+    last_sent = {k: v for k, v in json.loads(meta_get(db, "crypto_sent", "{}") or "{}").items() if v > ts - 86400}
+    held = {p["ticker"] for p in open_positions(db)}
+    hits, failed, stale = [], 0, 0
+    for sym in symbols:
+        rows = got.get(sym)
+        if not rows:
+            failed += 1
+            continue
+        bars = [b for b in rows if b["t"] + CANDLE <= ts]
+        if len(bars) < 200 or bars[-1]["t"] < expected - CANDLE:
+            stale += 1
+            continue
+        if evaluated.get(sym, 0) >= bars[-1]["t"] or sym in held:
+            continue
+        evaluated[sym] = bars[-1]["t"]
+        ctx = crypto_ctx(bars, sym)
+        if not ctx or not crypto_gate(ctx, cfg):
+            continue
+        ctx["mkt_chg"] = state["chg4h"]
+        found = [(b, e) for b in bots if ts - last_sent.get(f"{sym}:{b}", 0) >= cfg["crypto_cooldown_min"] * 60 and (e := CRYPTO_EVAL[b](ctx, cfg))]
+        if found:
+            found.sort(key=lambda x: -x[1]["score"])
+            hits.append((sym, found, rows))
+    log(f"crypto: {len(symbols)} coins, {failed} unavailable, {stale} late, {len(hits)} setup(s) found")
+    hits.sort(key=lambda h: (-len(h[1]), -h[1][0][1]["score"]))
+    count_key, sent = "crypto_count_" + day_key, 0
+    for sym, found, rows in hits:
+        if sent >= cfg["crypto_max_alerts_per_run"] or int(meta_get(db, count_key, "0") or 0) >= cfg["crypto_max_alerts_per_day"]:
+            break
+        e = found[0][1]
+        live = rows[-1]["close"]
+        for b, _ in found:
+            last_sent[f"{sym}:{b}"] = ts
+        if live <= e["stop"] or live >= e["entry"] + 0.5 * (e["target"] - e["entry"]):
+            log(f"crypto: skipped {sym}, the price already moved")
+            continue
+        hold_ts = ts + cfg["crypto_max_hold_hours"] * 3600
+        mkt_line = f"Market: Bitcoin is {state['chg4h']:+.1%} over the last 4 hours."
+        msg = format_crypto_alert(cfg, sym, found, e, live, ts, hold_ts, mkt_line)
+        checks, ok = [], True
+        if live:
+            checks.append(f"✔ Live price {fp(sym, live)} is still close to the signal ({fp(sym, e['entry'])}).")
+        try:
+            news = fetch_news(f"{coin_of(sym, cfg)} crypto", coin_of(sym, cfg), cfg["news_hours"])
+            if news["label"] == "negative" and news["neg"] - news["pos"] >= 2:
+                bad = [t for t, sc in news["items"] if sc < 0][:2]
+                checks.append("⚠️ Recent news looks negative: " + "; ".join(t[:90] for t in bad))
+                ok = False
+            else:
+                checks.append("✔ No clearly negative news in the last %d hours." % cfg["news_hours"])
+        except Exception:
+            checks.append("Couldn't check the news right now.")
+        bump(db, "check_ideas")
+        if not ok:
+            bump(db, "check_flagged")
+        msg += "\nCheck Bot (second look):\n  " + "\n  ".join(checks)
+        if not ok:
+            head, _, rest = msg.partition("\n")
+            msg = re.sub(r"^\S+ (STRONG|MODERATE|WEAK)", "⚠️ CAUTION", head) + "\n" + rest
+            msg += "\nI'd skip this one, so I'm not tracking a trade for it."
+        elif cfg["auto_track"]:
+            shares = open_crypto_trade(db, cfg, sym, live, e, [b for b, _ in found], hold_ts, ts)
+            msg += (f"\nTracking a ${cfg['position_usd']:,} simulated crypto trade ({shares:g} {coin_of(sym, cfg)} at ~{fp(sym, live)}). "
+                    f"I'll send a message when it hits the stop or the target, or when the time limit is up, with the % result.")
+        else:
+            msg += "\nI only track trades when AUTO_TRACK is on, so there will be no result message for this one."
+        msg += "\nNot financial advice. Crypto is very risky: prices can move fast, and fees and delays can wipe out small gains."
+        notify(msg)
+        bump(db, count_key)
+        sent += 1
+    meta_set(db, "crypto_evaluated", json.dumps(evaluated))
+    meta_set(db, "crypto_sent", json.dumps(last_sent))
+    db.execute("DELETE FROM meta WHERE k LIKE 'crypto_count_%' AND k<>?", (count_key,))
+    db.commit()
+    return sent if stale + failed <= len(symbols) // 2 else None
+
+
+def maybe_crypto(cfg: dict, db: sqlite3.Connection, notify, fetch=None, now: datetime | None = None) -> int:
+    """Called on every cloud run: follow open crypto trades, then look at the coins whenever a new 15-minute candle has closed."""
+    if not cfg["crypto_enabled"]:
+        return 0
+    now = now or utc_now()
+    ts = now.timestamp()
+    try:
+        log(f"crypto trades checked, {manage_crypto_trades(cfg, db, notify, fetch, ts)} closed")
+    except Exception as e:
+        log(f"crypto trade check failed: {type(e).__name__}: {e}")
+    expected = int(ts - CANDLE) // CANDLE * CANDLE
+    if int(meta_get(db, "crypto_bar", "0") or 0) >= expected:
+        return 0
+    try:
+        n = scan_crypto(cfg, db, notify, expected, ts, fetch)
+    except Exception as e:
+        log(f"crypto scan failed: {type(e).__name__}: {e}")
+        return 0
+    if n is None:
+        return 0
+    meta_set(db, "crypto_bar", expected)
+    return n
+
+
+def crypto_text(cfg: dict, db: sqlite3.Connection) -> str:
+    opens = [p for p in open_positions(db) if p.get("kind") == "crypto"]
+    today = utc_now().strftime("%Y-%m-%d")
+    td, al = day_totals(db, today, "crypto"), day_totals(db, "", "crypto")
+    info = json.loads(meta_get(db, "crypto_info", "{}") or "{}")
+    lines = [f"Crypto day trading is {'on' if cfg['crypto_enabled'] else 'off'} (new ideas between {cfg['crypto_hours']} o'clock your time).",
+             "Bots: " + ", ".join(f"{CRYPTO_BOTS[b][0]} ({'on' if b in enabled_crypto_bots(cfg, db) else 'off'})" for b in CRYPTO_BOTS)]
+    if info:
+        lines.append(f"Bitcoin: {'calm or rising' if info['state'] == 'up' else 'falling, ideas paused'} ({info['chg4h']:+.1%} in 4 hours)")
+    if opens:
+        lines.append("Open crypto trades:")
+        for p in opens:
+            px = p["last_price"] or p["entry_price"]
+            lines.append(f"  {coin_of(p['ticker'], cfg):6} in {fp(p['ticker'], p['entry_price'])}, now {fp(p['ticker'], px)} ({px / p['entry_price'] - 1:+.1%}), "
+                         f"stop {fp(p['ticker'], p['stop'])}, target {fp(p['ticker'], p['target'])}, "
+                         f"close by {hm(cfg, datetime.fromisoformat(p['exit_by']).timestamp())}")
+    else:
+        lines.append("No open crypto trades.")
+    lines.append(f"Today: {td['n']} closed, {td['wins']} winners, net {money(td['pnl'])}")
+    lines.append(f"All crypto trades: {al['n']} closed, {al['wins']} winners, net {money(al['pnl'])}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Crypto backtest: replay the three crypto bots on the last weeks of 15-minute candles
+# --------------------------------------------------------------------------- #
+def fetch_klines_history(symbol: str, days: int, fetch=None) -> list[dict]:
+    """About `days` days of 15-minute candles, fetched in pages of 1000."""
+    fetch = fetch or fetch_klines
+    need, out, end_ms = days * 96, [], None
+    while len(out) < need:
+        page = fetch(symbol, 1000, end_ms)
+        if not page:
+            break
+        out = page + out
+        end_ms = page[0]["t"] * 1000 - 1
+        if len(page) < 1000:
+            break
+        time.sleep(0.2)
+    return out[-need:]
+
+
+def sim_crypto_trade(S: list[dict], i: int, delay: int, stop: float, target: float, hold: int):
+    """Enter at the open of the candle `delay` candles after the signal; stop first if one candle hits both;
+    otherwise leave at the close of the `hold`-th candle. Returns (return, reason, exit index) or None."""
+    j0 = i + delay
+    last = min(len(S) - 1, j0 + hold - 1)
+    if j0 >= len(S) - 1:
+        return None
+    entry = S[j0]["open"]
+    if entry <= stop or entry >= target:
+        return None
+    for j in range(j0, last + 1):
+        b = S[j]
+        if b["low"] <= stop:
+            return min(b["open"], stop) / entry - 1, "stop-loss", j
+        if b["high"] >= target:
+            return max(b["open"], target) / entry - 1, "profit target", j
+    return S[last]["close"] / entry - 1, "time limit", last
+
+
+def cmd_backtest_crypto(cfg: dict, days: int = 45, coins: int = 27, cost_pct: float = 0.20, delays: list[int] | None = None, fetch=None) -> None:
+    import random
+    delays, fetch = delays or [1, 2], fetch or fetch_klines
+    cost, R = cost_pct / 100, cfg["day_target_r"]
+    hold = max(1, int(cfg["crypto_max_hold_hours"] * 4))
+    quote = cfg["crypto_quote"]
+    try:
+        btc = fetch_klines_history(f"BTC{quote}", days, fetch)
+    except Exception as e:
+        sys.exit(f"Couldn't download Binance prices, so I can't run the backtest.\nCheck your internet connection and try again. Details: {e}")
+    if len(btc) < 400:
+        sys.exit("Not enough Bitcoin price history came back to run the backtest.")
+    btc_ok = {}
+    for k in range(16, len(btc)):
+        btc_ok[btc[k]["t"]] = (btc[k]["close"] / btc[k - 16]["close"] - 1 > -0.015, btc[k]["close"] / btc[k - 4]["close"] - 1 > -0.01,
+                               btc[k]["close"] / btc[k - 16]["close"] - 1)
+    bots = list(CRYPTO_BOTS)
+    res = {d: {b: [] for b in bots} for d in delays}
+    base = {d: {b: [] for b in bots} for d in delays}
+    ends = {d: {b: {"stop-loss": 0, "profit target": 0, "time limit": 0} for b in bots} for d in delays}
+    signals = {b: 0 for b in bots}
+    failed, n_coins, span_days = [], 0, 0.0
+    symbols = crypto_symbols({**cfg, "crypto_coins": cfg["crypto_coins"][:coins] if cfg["crypto_coins"] else CRYPTO_COINS.split()[:coins]})
+    for n, sym in enumerate(symbols, 1):
+        try:
+            S = btc if sym == f"BTC{quote}" else fetch_klines_history(sym, days, fetch)
+        except Exception as e:
+            failed.append(sym)
+            print(f"  [{n}/{len(symbols)}] {sym}: skipped ({str(e)[:50]})", flush=True)
+            continue
+        if len(S) < 400:
+            failed.append(sym)
+            continue
+        n_coins += 1
+        span_days = max(span_days, (S[-1]["t"] - S[0]["t"]) / 86400)
+        print(f"  [{n}/{len(symbols)}] {sym}: {len(S)} candles", flush=True)
+        free_at, cool = -1, {b: -10**9 for b in bots}
+        for i in range(260, len(S) - hold - 3):
+            if i <= free_at:
+                continue
+            ok = btc_ok.get(S[i]["t"])
+            if not ok or not (ok[0] and ok[1]):
+                continue
+            ctx = crypto_ctx(S[i - 299:i + 1] if i >= 299 else S[:i + 1], sym)
+            if not ctx or not crypto_gate(ctx, cfg):
+                continue
+            ctx["mkt_chg"] = ok[2]
+            for bot in bots:
+                if i - cool[bot] < cfg["crypto_cooldown_min"] // 15:
+                    continue
+                e = CRYPTO_EVAL[bot](ctx, cfg)
+                if not e:
+                    continue
+                cool[bot] = i
+                signals[bot] += 1
+                rng = random.Random(f"{sym}{i}{bot}")
+                first = None
+                for d in delays:
+                    r = sim_crypto_trade(S, i, d, e["stop"], e["target"], hold)
+                    if r is None:
+                        continue
+                    first = first or r
+                    res[d][bot].append(r[0] - cost)
+                    ends[d][bot][r[1]] += 1
+                    k = rng.randint(260, len(S) - hold - 5)                # random-time entry, same stop and target distances
+                    ent = S[k + d]["open"]
+                    rb = sim_crypto_trade(S, k, d, ent * (1 - e["risk_pct"]), ent * (1 + e["risk_pct"] * R), hold)
+                    if rb:
+                        base[d][bot].append(rb[0] - cost)
+                if first:
+                    free_at = max(free_at, first[2])
+    if n_coins < 5:
+        sys.exit("Could not download enough coins to run the backtest.")
+    pc = lambda x: f"{x:+.2%}"
+    print(f"\nCRYPTO SUMMARY: {n_coins} coins, about {span_days:.0f} days of 15-minute candles, costs {cost:.2%} per round trip "
+          f"(Binance charges about 0.1% per side)")
+    print(f"Rules: signal on a finished 15-minute candle; you buy {delays[0]} candle(s) later at its open (second table: {delays[-1]}); "
+          f"stop at the bot's stop, target {R:g}x the risk, closed after {cfg['crypto_max_hold_hours']:g} hours at the latest; "
+          f"no ideas while Bitcoin is falling.\n")
+    for d in delays:
+        print(f"If you act {d} candle(s) after the signal (about {d * 15 - 10}-{d * 15 + 5} min of delay)")
+        print(f"{'Bot':22} {'Trades':>7} {'Per day':>8} {'Win rate':>9} {'Avg trade':>10} {'Random time':>12}   Verdict")
+        for b in bots:
+            st, bs = trade_stats(res[d][b]), trade_stats(base[d][b])
+            if not st["n"]:
+                print(f"{CRYPTO_BOTS[b][0]:22} {0:>7} {'':>8} {'':>9} {'':>10} {'':>12}   no trades (rules never matched)")
+                continue
+            b0 = bs["avg"] if bs.get("n") else 0.0
+            verdict = ("too few trades to judge" if st["n"] < 30 else
+                       "beat random timing: worth keeping on" if st["avg"] > 0.0005 and st["avg"] > b0 + 0.001 else
+                       "profitable, but no better than random timing" if st["avg"] > 0 else
+                       "lost money: turn it off")
+            print(f"{CRYPTO_BOTS[b][0]:22} {st['n']:>7} {st['n'] / max(1, span_days):>8.1f} {st['win']:>9.0%} {pc(st['avg']):>10} {pc(b0):>12}   {verdict}")
+        print()
+    d0 = delays[0]
+    print(f"How the trades ended (delay {d0}): " + "; ".join(
+        f"{CRYPTO_BOTS[b][0]}: " + ", ".join(f"{k} {v / max(1, sum(ends[d0][b].values())):.0%}" for k, v in ends[d0][b].items()) for b in bots))
+    tot = sum(len(res[d0][b]) for b in bots)
+    print(f"\nAll three bots together: about {tot / max(1, span_days):.1f} trades a day across {n_coins} coins "
+          f"(so roughly one every {24 * 60 * max(1, span_days) / max(1, tot):.0f} minutes, day and night).")
+    print("\nHOW TO READ THIS")
+    print(" * 'Random time' = the same stop and target distances, entering at a random time. A bot only helps if its average trade is clearly above that.")
+    print(" * Only a few weeks of data, one market mood. Wait for 30+ trades per bot; today's biggest coins make old results look better.")
+    print(" * Compare the two tables: the more your delay costs, the less this works for you. Fees matter a lot: a small gain per trade can vanish.")
+    if failed:
+        print(f"\n(Skipped, no data: {', '.join(failed)})")
 
 
 # --------------------------------------------------------------------------- #
@@ -1289,14 +2863,26 @@ def trade_stats(rets: list[float]) -> dict:
             "best": max(rets), "worst": min(rets)}
 
 
+def scaled_cfg(cfg: dict, ticker: str) -> dict:
+    """The liquidity limit is in US dollars; for a stock priced in another currency it is converted."""
+    return {**cfg, "scan_min_dollar_volume": min_turnover(cfg, ticker)}
+
+
+class AlwaysHealthy(dict):
+    def get(self, key, default=None):
+        return True
+
+
 def run_backtest(cfg: dict, data: dict, spy: list[dict], holds: list[int], cost: float,
-                 bot: str = "dip", exits: bool = False, sigs: dict | None = None) -> dict:
+                 bot: str = "dip", exits: bool = False, sigs: dict | None = None, ok_by: dict | None = None) -> dict:
     """data: ticker -> bars. Applies the same cooldown, one-trade-per-stock and daily alert cap as the live scanner.
     `exits` adds the overbought and trend-break sell signals."""
     from collections import defaultdict
     spy_ok = spy_health_by_date(spy)
+    ok_by = ok_by or {}                              # ticker -> {date: is that stock's market healthy}
+    ok_of = lambda t: ok_by.get(t, spy_ok)
     if sigs is None:
-        sigs = {t: scan_signals(b, spy_ok, cfg, bot) for t, b in data.items()}
+        sigs = {t: scan_signals(b, ok_of(t), scaled_cfg(cfg, t), bot) for t, b in data.items()}
     inds = {t: indicators(b) for t, b in data.items()} if exits else {}
     by_date = defaultdict(list)
     for t, lst in sigs.items():
@@ -1321,7 +2907,7 @@ def run_backtest(cfg: dict, data: dict, spy: list[dict], holds: list[int], cost:
         base = []                                  # benchmark: buy any of these stocks on any day the market is healthy
         for t, bars in data.items():
             for i in range(220, len(bars) - 1, 3):
-                if not spy_ok.get(bars[i]["date"]):
+                if not ok_of(t).get(bars[i]["date"]):
                     continue
                 entry, d0 = bars[i + 1]["open"], datetime.fromisoformat(bars[i + 1]["date"])
                 for k in range(i + 1, min(len(bars), i + 1 + hold + 8)):
@@ -1374,32 +2960,51 @@ def print_backtest(res: dict, cfg: dict, first: str, last: str, n_stocks: int, y
     print(" * Prices are daily, so stop-loss fills are optimistic in fast markets. Taxes and spreads are not included.")
 
 
-def cmd_backtest_scan(cfg: dict, years: float, holds: list[int], cost_pct: float) -> None:
+def cmd_backtest_scan(cfg: dict, years: float, holds: list[int], cost_pct: float, stocks: int = 100, market: str = "US") -> None:
     days = int(years * 365) + 330                     # plus a year of warm-up for the 200-day average
     cost = cost_pct / 100
     try:
         spy = fetch_history("SPY", days)
     except Exception as e:
         sys.exit(f"Couldn't download price data, so I can't run the backtest.\nCheck your internet connection and try again. Details: {e}")
-    tickers = [t.upper() for t in (cfg["scan_tickers"] or DEFAULT_SCAN)]
+    wanted = None if market.lower() == "all" else market.lower()
+    universe, per = [], {}
+    for t in ([x.upper() for x in cfg["scan_tickers"]] if cfg["scan_tickers"] else DEFAULT_SCAN + GLOBAL_TICKERS):
+        m = market_name(t)
+        if wanted and m.lower() != wanted:
+            continue
+        per[m] = per.get(m, 0) + 1
+        if per[m] <= max(5, stocks):                  # the biggest companies of each market first
+            universe.append(t)
+    if not universe:
+        sys.exit(f"No stocks for market '{market}'. Try: US, UK, Germany, France, Netherlands, Switzerland, Canada, Australia, Japan, Hong Kong, Romania or all.")
+    ok_by, index_ok = {}, {}
     data, failed = {}, []
-    for n, t in enumerate(tickers, 1):
+    for n, t in enumerate(universe, 1):
         try:
             time.sleep(0.3)
             data[t] = fetch_history(t, days)
-            print(f"  [{n}/{len(tickers)}] {t}: {len(data[t])} days", flush=True)
+            suf = market_suffix(t)
+            if suf not in index_ok:
+                idx = MARKETS[suf][1]
+                try:
+                    index_ok[suf] = spy_health_by_date(spy if suf == "" else fetch_history(idx, days)) if idx else AlwaysHealthy()
+                except Exception:
+                    index_ok[suf] = AlwaysHealthy()
+                    print(f"  (no {MARKETS[suf][0]} index data: that market is tested without a market filter)", flush=True)
+            ok_by[t] = index_ok[suf]
+            print(f"  [{n}/{len(universe)}] {t}: {len(data[t])} days", flush=True)
         except Exception as e:
             failed.append(t)
-            print(f"  [{n}/{len(tickers)}] {t}: skipped ({str(e)[:60]})", flush=True)
+            print(f"  [{n}/{len(universe)}] {t}: skipped ({str(e)[:60]})", flush=True)
     if len(data) < 5:
         sys.exit("Could not download enough price data to run the backtest.")
     print(f"\nTesting {len(BOTS)} bots on {len(data)} stocks (this takes a few minutes)...", flush=True)
-    spy_ok = spy_health_by_date(spy)
     results, alt = {}, {}
     for bot in BOTS:
-        sigs = {t: scan_signals(b, spy_ok, cfg, bot) for t, b in data.items()}
-        results[bot] = run_backtest(cfg, data, spy, holds, cost, bot, cfg["exit_signals"], sigs)
-        alt[bot] = run_backtest(cfg, data, spy, holds[:1], cost, bot, not cfg["exit_signals"], sigs)
+        sigs = {t: scan_signals(b, ok_by[t], scaled_cfg(cfg, t), bot) for t, b in data.items()}
+        results[bot] = run_backtest(cfg, data, spy, holds, cost, bot, cfg["exit_signals"], sigs, ok_by)
+        alt[bot] = run_backtest(cfg, data, spy, holds[:1], cost, bot, not cfg["exit_signals"], sigs, ok_by)
         print(f"  {BOTS[bot][1]} done", flush=True)
     first, last = spy[220]["date"], spy[-1]["date"]
     h0 = holds[0]
@@ -1598,20 +3203,37 @@ BOT_INFO = {
     "breakout": (BOTS["breakout"][1], BOTS["breakout"][3]),
     "trend": (BOTS["trend"][1], BOTS["trend"][3]),
     "gap": (BOTS["gap"][1], BOTS["gap"][3]),
+    "orb": DAY_BOTS["orb"],
+    "vwap": DAY_BOTS["vwap"],
+    "gapgo": DAY_BOTS["gapgo"],
+    "cbreak": CRYPTO_BOTS["cbreak"],
+    "cvwap": CRYPTO_BOTS["cvwap"],
+    "cdip": CRYPTO_BOTS["cdip"],
     "exit": ("Exit Bot", "Watches your open trades and tells you when to sell, then reports the profit or loss."),
+    "check": ("Check Bot", "Double-checks every buy idea (live price from two sources, latest news) and the prices in your closed trades."),
 }
 
 
 def classify_alert(text: str) -> str:
     """Which bot sent an alert, judged from its first line. '' if it is none of them."""
     first = text.split("\n", 1)[0]
+    if "Check Bot" in first or "CAUTION" in first:
+        return "check"
     if "confirmed by" in first:
         return "multi"
+    if "crypto day-trade idea" in first:
+        for key, (name, _) in CRYPTO_BOTS.items():
+            if name in first:
+                return key
+    if "day-trade idea" in first:
+        for key, (name, _) in DAY_BOTS.items():
+            if name in first:
+                return key
     for key, word in (("dip", "dip-buy idea"), ("breakout", "breakout idea"), ("trend", "trend idea"),
                       ("gap", "gap-up idea"), ("insider", "insider buy")):
         if word in first:
             return key
-    if "SELL signal" in first or "Trade closed" in first or "Heads-up" in first:
+    if "SELL signal" in first or "Trade closed" in first or "Day trade closed" in first or "Crypto trade closed" in first or "Heads-up" in first:
         return "exit"
     if "overall market" in first or "\U0001F4C9" in first or "\U0001F4C8" in first:
         return "market"
@@ -1620,12 +3242,12 @@ def classify_alert(text: str) -> str:
 
 def bot_rows(cfg: dict, db: sqlite3.Connection, alerts: list[dict]) -> list[dict]:
     """One row per bot for the app's Bots tab: is it on, when it last spoke, and how its tracked trades did."""
-    on_scan = set(enabled_bots(cfg, db))
+    on_scan, on_day, on_cr = set(enabled_bots(cfg, db)), set(enabled_day_bots(cfg, db)), set(enabled_crypto_bots(cfg, db))
     names = {v[0]: k for k, v in BOT_INFO.items()}
     closed = [dict(r) for r in db.execute("SELECT bot, pnl, ret FROM positions WHERE status='closed'")]
     cutoff = (utc_now() - timedelta(days=30)).isoformat(timespec="seconds")
     rows = []
-    for key in ("market", "insider", "dip", "breakout", "trend", "gap", "exit"):
+    for key in ("market", "insider", "dip", "breakout", "trend", "gap", "orb", "vwap", "gapgo", "cbreak", "cvwap", "cdip", "exit", "check"):
         mine, last, n30 = [], "", 0
         for a in alerts:
             kind = a["bot"]
@@ -1641,14 +3263,48 @@ def bot_rows(cfg: dict, db: sqlite3.Connection, alerts: list[dict]) -> list[dict
                 mine.append(c)
         wins = sum(1 for c in mine if c["pnl"] > 0)
         rows.append({"id": key, "name": BOT_INFO[key][0], "what": BOT_INFO[key][1],
-                     "on": key in on_scan if key in BOTS else True, "last_at": last, "alerts30": n30,
+                     "on": key in on_scan if key in BOTS else key in on_day if key in DAY_BOTS else key in on_cr if key in CRYPTO_BOTS else True,
+                     "group": "day" if key in DAY_BOTS else "crypto" if key in CRYPTO_BOTS else "", "last_at": last, "alerts30": n30,
                      "n": len(mine), "wins": wins,
                      "avg_ret": round(sum(c["ret"] for c in mine) / len(mine), 4) if mine else 0.0})
+    mi = lambda k: int(meta_get(db, k, "0") or 0)
+    rows[-1].update({"on": True, "ideas": mi("check_ideas"), "ideas_flagged": mi("check_flagged"),
+                     "audited": mi("audit_checked"), "audit_flagged": mi("audit_flagged")})
+    for a in alerts:                                   # last time it raised a warning
+        if "Check Bot" in a["text"].split("\n", 1)[0] or a["text"].startswith("⚠️ CAUTION"):
+            rows[-1]["last_at"] = a["at"]
+            break
     return rows
 
 
-def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=None) -> dict:
-    history_fn = history_fn or fetch_history
+def day_block(cfg: dict, db: sqlite3.Connection, now: datetime) -> dict:
+    today = now.strftime("%Y-%m-%d")
+    return {"enabled": bool(cfg["day_enabled"]), "markets": cfg["day_markets"],
+            "info": json.loads(meta_get(db, "day_info", "{}") or "{}"), "now": int(now.timestamp()),
+            "alerts_today": int(meta_get(db, "day_count_" + today, "0") or 0),
+            "today": day_totals(db, today), "all": day_totals(db), "target_r": cfg["day_target_r"],
+            "close_min": cfg["day_close_minutes"]}
+
+
+def cur_for(ticker: str, price: float):
+    """How the app writes prices for this ticker: stocks use their market's currency, coins get more decimals when cheap."""
+    if is_crypto(ticker):
+        return ["$", "", 2 if price >= 100 else 4 if price >= 1 else 5 if price >= 0.01 else 7]
+    return cur_of(ticker)
+
+
+def crypto_block(cfg: dict, db: sqlite3.Connection, now: datetime) -> dict:
+    today = now.strftime("%Y-%m-%d")
+    return {"enabled": bool(cfg["crypto_enabled"]), "hours": cfg["crypto_hours"], "hold_hours": cfg["crypto_max_hold_hours"],
+            "info": json.loads(meta_get(db, "crypto_info", "{}") or "{}"), "now": int(now.timestamp()),
+            "alerts_today": int(meta_get(db, "crypto_count_" + today, "0") or 0),
+            "today": day_totals(db, today, "crypto"), "all": day_totals(db, "", "crypto"), "target_r": cfg["day_target_r"]}
+
+
+def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=None, day_history_fn=None, crypto_history_fn=None) -> dict:
+    history_fn = history_fn or (lambda t, n: fetch_history(t, n, min_bars=20))
+    day_history_fn = day_history_fn or (lambda t: fetch_intraday(t, "2d"))
+    crypto_history_fn = crypto_history_fn or (lambda t: fetch_klines(t, 100))
     closed = [dict(r) for r in db.execute("SELECT * FROM positions WHERE status='closed' ORDER BY exit_at, id")]
     cum, equity = 0.0, []
     for p in closed:
@@ -1658,17 +3314,20 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
     opens = []
     for p in open_positions(db):
         last = p["last_price"] or p["entry_price"]
-        sell_by = datetime.fromisoformat(p["entry_at"]) + timedelta(days=cfg["max_hold_days"])
-        opens.append({"ticker": p["ticker"], "shares": p["shares"], "entry_price": p["entry_price"],
-                      "entry_at": p["entry_at"], "last_price": last, "mine": bool(p["manual"]), "bot": p["bot"] or "",
-                      "pnl": round((last - p["entry_price"]) * p["shares"], 2), "ret": round(last / p["entry_price"] - 1, 4),
-                      "days": held_days(p), "stop": round(p["entry_price"] * (1 - cfg["stop_loss_pct"]), 2),
-                      "target": round(p["entry_price"] * (1 + cfg["take_profit_pct"]), 2),
+        isday = p.get("kind") in ("day", "crypto")
+        sell_by = datetime.fromisoformat(p["exit_by"]) if isday else datetime.fromisoformat(p["entry_at"]) + timedelta(days=cfg["max_hold_days"])
+        opens.append({"day": isday, "crypto": p.get("kind") == "crypto", "exit_by": p["exit_by"] if isday else "", "ticker": p["ticker"], "shares": p["shares"], "entry_price": p["entry_price"],
+                      "entry_at": p["entry_at"], "last_price": last, "mine": bool(p["manual"]), "bot": p["bot"] or "", "cur": cur_for(p["ticker"], p["entry_price"]),
+                      "coin": coin_of(p["ticker"], cfg), "pnl": round((last - p["entry_price"]) * p["shares"] / usd_rate(p["ticker"]), 2), "ret": round(last / p["entry_price"] - 1, 4),
+                      "days": held_days(p), "stop": round(p["stop"], 4) if isday else round(p["entry_price"] * (1 - cfg["stop_loss_pct"]), 2),
+                      "target": round(p["target"], 4) if isday else round(p["entry_price"] * (1 + cfg["take_profit_pct"]), 2),
                       "sell_by": sell_by.strftime("%Y-%m-%d")})
     recent = [
         {"ticker": p["ticker"], "shares": p["shares"], "entry_price": p["entry_price"], "exit_price": p["exit_price"],
          "entry_at": p["entry_at"], "exit_at": p["exit_at"], "pnl": round(p["pnl"], 2), "ret": round(p["ret"], 4),
-         "reason": p["exit_reason"], "mine": bool(p["manual"]), "bot": p["bot"] or ""} for p in reversed(closed[-30:])]
+         "reason": p["exit_reason"], "mine": bool(p["manual"]), "bot": p["bot"] or "", "cur": cur_for(p["ticker"], p["entry_price"]),
+         "coin": coin_of(p["ticker"], cfg),
+         "day": p.get("kind") in ("day", "crypto"), "crypto": p.get("kind") == "crypto"} for p in reversed(closed[-30:])]
     wins = sum(1 for p in closed if p["pnl"] > 0)
     alerts = []
     for r in db.execute("SELECT at, text FROM alerts_log ORDER BY id DESC LIMIT 300"):
@@ -1679,11 +3338,24 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
     for t in [p["ticker"] for p in opens] + [p["ticker"] for p in recent[:10]]:
         if t not in tickers:
             tickers.append(t)
+    day_open = {p["ticker"] for p in opens if p["day"]}
     for t in tickers[:20]:
+        if t in day_open:
+            continue
         try:
             charts[t] = [[b["date"], round(b["close"], 2)] for b in history_fn(t, 220)[-120:]]
         except Exception as e:
             log(f"app: no price history for {t} ({type(e).__name__})")
+    charts_day = {}
+    for t in sorted(day_open)[:10]:                                   # today's 15-minute prices for the open day trades
+        try:
+            if is_crypto(t):
+                charts_day[t] = [[b["t"], round(b["close"], 6)] for b in crypto_history_fn(t)[-96:]]
+            else:
+                d = day_history_fn(t)
+                charts_day[t] = [[b["t"], round(b["close"], 4)] for b in d["sessions"][-1]]
+        except Exception as e:
+            log(f"app: no intraday prices for {t} ({type(e).__name__})")
     key_pub = ""
     if have_crypto():
         try:
@@ -1692,7 +3364,8 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
             pass
     return {"v": 1, "generated_at": now.isoformat(timespec="seconds"),
             "market": meta_get(db, "market_state"), "market_info": json.loads(meta_get(db, "market_info", "{}") or "{}"),
-            "bots": bots,
+            "regions": json.loads(meta_get(db, "regions_info", "{}") or "{}"),
+            "bots": bots, "day": day_block(cfg, db, now), "crypto": crypto_block(cfg, db, now), "charts_day": charts_day,
             "rules": {k: cfg[k] for k in ("stop_loss_pct", "take_profit_pct", "trailing_stop_pct", "max_hold_days",
                                           "position_usd", "auto_track", "exit_signals")},
             "push": {"available": bool(key_pub), "key": key_pub, "devices": len(json.loads(meta_get(db, "push_subs", "[]")))},
@@ -1704,194 +3377,225 @@ def build_app_data(cfg: dict, db: sqlite3.Connection, now: datetime, history_fn=
 # <<APP_FILES_BEGIN>>
 APP_FILES_B64 = {
     "index.html": (
-        "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"
+        "eNrtfVtzHEeW3jt/RZGr2e6e6S50NwGIBARpSYiU5BEvIVCjkTk0Wd1dQJfQt62qBtDmIGLCEXb4wS+2IzbCG7sOP/nB4Rf7"
+        "2U/+Kfol/r5zMrOyqqtxoTizEY6dXRHVVXk9efKck+eWn90dzYf5ahEH43w6+fzOZ/wTTKLZycG9eHaPL+JohD/TOI+C4ThK"
+        "szg/uLfMjzsP7tnXs2gaH9w7S+LzxTzN7wXD+SyPZyh2nozy8cEoPkuGcUd+tINkluRJNOlkw2gSH/Taga3XOU7yg+H8LE4r"
+        "DefjeBp3hvPJPPXa/qun2093nz64F0zjURId3Gsu0vg4TjMtiOZZay+YJCfjvHWzFrtf9rq9netaHEXpabVBv4TXonQuFSrl"
+        "o8ViEnem80GCP+fxoIMXnWG0iAYTv/4qzioVP6BKbV95kpeqPZrEaX6jmlke5cusM4gw33xVamQUH0fLSc5WJsnsNEjjCUYc"
+        "zZLjOANajAHO4neIBt23Ug3tNp8vh+NOgsZtTT53eg+64WJ2Uq6xXuph35aSmX7+zSxLRnEa6Dw/29K3dz6TKXx+Zy+dz/Pg"
+        "/Z0g6HQW0SJO9wKDX/t4ky3T42gY8538j+/QN34DXx70pcx0mccjvNl5vLv7qbzB8Fjly8MnvScP9qXpkyiZ4VX36aePdw+l"
+        "zDzL8OKwv929/1i6Sk5m0QSv+oc7nz7parUsmqFUR+GSrbI8nraDx5z+s2h4JL+fYg3awb2jp8HLdB68ii/ye/wZn8zj4Ptv"
+        "8KzVOssEj2iuk8Vpcmya5+NesEz0CfWex+fBj3NgLZ6/mZ9Hs+DFZBQcyXK3g6/ieXqSRPj2KpnGWcDS382xluxGm7288zey"
+        "iYKr9pDA20Deg7vuwjLcezu9R/1eAfcnXz7tPt3x4f7gycOHjx57cO/v9r+8/5AztP9z8L9/ePjw0QMP/k+xIJ/eL8H/we6j"
+        "Plf6EnP5NcY3mF/g479OZid7eE6BSx28QhWg8WmSd/Jo0Rlju8uW19nuBXkKUC+iFLuDLQltRVPR8PQknS9nGPdZlDbN1Fss"
+        "MpiPVigyjQBhDLW7f0Vp04m+BFzw6hhosBf0dhcXW71we8d844K3HCTciIEknFLciUY/LTPW63Z/tR9Mk1lnHHMa8uZsLONa"
+        "5vl8Ruq9WALRWBfTijBU7TKZjbHyuRuU+22rouRwmWb8tpgnIBgpv+0dz4cgJmdJloCMocx8mev63V9cBNl8kozsHGRhMEVT"
+        "ojM/PgYr2gv6C6yCWZE0GiVLLOgu313euRNiywg0L5T74Mt2l98cfINomc/3g0U0GsnSgikNm/HsrJlFxwAMpgjIoh+Qo0Ur"
+        "+E3QR/UWqkm5h+gb7+qKD+aY9LQlaxqidYzC9IECOsN+V0cZCgoTPv56ykutnk2jycRAWhYM67Jt6i4X1YrEcdYLwtH8fFb9"
+        "SoRvKWwwIw4EJUZJtphEq73geBKjWSJDcrzqGLq+FwCFwb8HcX4ex7P9IAKOzzoJyAlAPYx1LU+iBYYli+EjUP+BGajtLTwf"
+        "x7O6yWyaPen5IJ9V9s1sPovtsss2Meu7LW3Z3vWXXewOxhJ0el3+y0fUcjM/SZMR0GDCiVZmVjuwCsL1+2aadrTZ2QlGbAal"
+        "Xx1IbNlskdiC4IPTKE/mMwIbb7vhwywgvKIUW+mYMlPMOn9zGq+O04hUV8q9D/I5/yGdOZ6n070gnYM/x837u91RfCJ4sE6L"
+        "03i0HMYjcHbtUn+DHgcbxqTQvhS0gXw2Soa52/m73W5wvysEp+cIDrkAOp/EOUDYIf7I7up0w24vnhZLIovR1f0q9Og8JR4N"
+        "IkigQ5lxOIlHcZkibsCUOyG23wjkwStNWMtGC7bXMFOW4WZoKKXwKonwd7acYnpDUPdosJxADMKLTIZK8Zi9L+ZZYiE7AQjP"
+        "MBMVZ6Khvl9Es85qP1hmhE48iYe5BbKlzjWfXA+6Pg53B5P58BSEEStzPJmfY/BKTr0ahC1XLJlM6uamO7fELTBEUOmO2WBZ"
+        "ns5P0aD+rTIifWtJrIDRvCIK/zTnSsi+9UYUTmZuQDq9civ9sL+zuRnv/ZAIs9Y6MB3Nl5vsuXqjKEOxlMDbDrb9eifLRNCt"
+        "PFELq7X2hLCBGZHobibEUoSUdxM1NkUoz76vY+u2gDLBahnHGjGaeLrIV3UbwONxPUP8DA0DZca7CrslZAsyp9xsY6mNGxLS"
+        "W575qKpklv9C/JjiXS7HsOWUAm7vOOV/HnWQgXKobuxdmaW2O0rOCraq+9dM9QYz81vZm+XjznCcTEbN+WjUEmlPybuRgq5r"
+        "Ir8NQzN1Rv4q2XkWJLXfE5Lar5LUG5Ii20lod740vIOGjXB4vywccrnG/TCLhyXC3lfC3q8Mwo6bdF/Jq2HzpolwiP2YbxJp"
+        "ZArnlkV3dUknSZaXyby/5vyqx80y678OM8mRgWjFil6DEun8fF0euk7eseRApOdadLxKcBG2J11AWREf52UutWsFPY4sPNHx"
+        "cVhCfljS9N4tSvHwXlrF3sPaVbTls+Xgxvir66NglMkXXGecjEYUD2VCxet4MkkWWQK0PB8DhiIMyCqS1ReDkK1GUcYDh7y7"
+        "GcorSByf9JoMB8mJnZ5Fut1ud62YlbI3bVspK2qDams7XcFQ0Gd3bArvG6YSnxViYO+BLwbqL3/ctT2LaGekCSfmQT7s7chG"
+        "f02wdOILCBSjeATNVrqM770JbM/rguFDKxfeRir0W0uqImE4gsYomfikWAmHmWJRwglIxfGr41MPW2458cpUeUCHm2Rvre1J"
+        "4tXZVgaHr+Y8XUI9TLijyHeObdgZQGyETkH+dPimLBXurO0F5cnFHLqB3aTSW3QVf86jkuimZ8GOkeD8bvsbt6ClHVezbHsy"
+        "efjwYYn5dxXYZh8rLOUNNmye4FhrN18hHh9H02Sy2ivzizoijqPsqYfupaOY/qps0+lphyLV7MRjuWbcOySm67oPH5aoPZ2j"
+        "DtB6U30Dqv4mZYLfgR63OidsAURed0q7XIPNtn21Dl+40ZwDgz50JAYa8aReQ2QkxSFoKcRugncxn6xO5rMm8K8tvId/0Zc8"
+        "F0NKZrXtGeG0pr0dbUla5D9toEypSQwl/qhjPIYY2A74hKPuvLZpi/u1bW9zkNJ68bSrA9/1upnF59ltG78WGKLYuhnq2vOA"
+        "1js+viWmeKyIiA8Fapz/kukIJu9487KYDLYVpaPaQ7TSVPk87t9GUOxaumOrL0pcoGvoHUloXo+wSnRLBNEePz1hqgJQbdWj"
+        "fco1fAFr+4Gjc1XpAEMJo0leq3mqYQjX0GVtMFsXL1WS7FryaFQgyqBKDM1B8DiJJyOP0K6pbXVStcC4jnusU1xVwrfKcLQc"
+        "b5qdeCtp1DndOk2LFg7jNN2okwzT5STOak8BVa6vJTcw/SxeuM21d8OTrkP23RKyQ8M6I3P2pZvrdMQ7u9QRq9bJaJud/nl7"
+        "t1b/fOn6GffKmrV+vWattHesItk0sdgkxfqV3KKYSiJWrp/Ui1MOYDGLziDADLKSius4uYhH+4GuD2BmzswCdT2b+XrWDRpm"
+        "c6ryjDUlTFTj0TS5aFI7mZ4M2iUSEDyscOVWoUdjM6N0voB1eZITHQaTZdok/hps3/SxNJbr8cfiqZ30FUYBwtKBMhQGXYFP"
+        "eWOvWS+86s644s6EVx42/W25s1sijg8KTWwFCexq1Z2A+1frTH1h1ht1WTtekhP727Uz1HMOLEipWJoX0QmPOZsE7VpyPppv"
+        "0s3qx7296BgTk0YNWt67t+9VwGigqspFmYupd3ocqUH3zranCSid8+pI8QYJoSCEepb2EYNLGdxNpvSUiNSc+NmWsV5/tmWc"
+        "NHj+wB8qxhIcBmlavff5Z1v4TVP3ME0W+ed3ms1WcPA5jK8N6Jip0oQ2v7F/587Wr2H/tP8L9Dg8jifYYJn/4ddbdwAfKGuy"
+        "fJ7GwYFYcU/ivEmDLjYhj1tpnC/TWQDCEk2OUAyrFaLIN0Cgpuozh1E+HAfNt62i9Gw5mciJso0GMzaIXV60WWoss42xSKU9"
+        "08IonvhDKlVP4ykUFPXDkeqX+2aSR7/76vkRJtkY5/lib2vr/Pw8PL8fwgC+1e92u1vAZMDueDkTxX4wbuKA18YJc77IINKG"
+        "4WkyytTQre3FEzQGlxtoMWZ5OARtyOMnk5i/WFXIDkhx0NTirznBN8H8OHgx+AmmgBDl0iTOmtJD8Mc/YrwtbT8IkuOgeRYc"
+        "HAgk+Y0/DoLjaJLhGE+kTmbLeN+VPZXPjeEkyrJGC0ML5fE51UcHwZkWjFFZS4fw/IDvxA9JPm425rNGS6qAfDw5w6i+hYYu"
+        "nsUpy03g7tPst2RtikZQGMv2KMcEsKdjWTsZAXUWwRdBoxHsmRqXZSgAiAQBYRnysNAsTZlfvUnrzw3T5oAXi3g2Yq1whtPj"
+        "K/o+fSG19qoLQzeK5yjTPMKYZyes02q5ARq0jSd0d3AYkCkGRJjmrTHg+VFT8A287BaoIF05VKiDcrWpOnhaSN5VSLY+GqhK"
+        "YNL+vzl8IZuKQMnnI5K3xmc8qQQgWs/uB71PJzudXZhm7gcPOg/vbX3uf+z3xr0HeNfgJp9jgKXKD4Ldce8+/vT65u8D/GUT"
+        "wyQdQnc3vDi4tw2fpdXBvd17QXpwr1f/sde/8usD91XGEYlbUWkku8HDaDfYpXzG/+sH3SHYa9APPuV/X29n/U4v6Hc+LU2v"
+        "x5NU1EeJriqWgq7tAqsKRD4pd7IdfDrudZ/1HuBvH796/INGenxdGXpvV8f+qQy9X/n6wEys+Cq9QmSRHlNgXIBi8I5DqYf3"
+        "lNWhPACinA7PXdRFmfvlKfWDh7/bqY6lr91t1wL5YbhjRlP/vbddU0CGC1VmGmfjEoz6AEcvehA8kKXodvrh/WAnLMMdZbbP"
+        "Ph3LakhD1HiWWnkY7Ew+DT7t4D8tc+mRfVr9m1S7t3HqXt/tWbNBPtEGG6Kz4+M5JLWGCOHb+H+8VzNogzwev6ztsWHEnUPK"
+        "OHjf8M2PDXzvhQ+818YYyg8iVVQ+0X5a+iYSlQoafE8q3OD4I7pEYRokKaDJl7KLQQ2SGcj716+efYsZyQ5+zRm/2bDHn33z"
+        "/HthnD//+//UsNx0ASQ6CJoX7QA0OuiJHNK8CD4/ACzAAH5DDiAVeYx6BtCHkLlQ4NcUhVuwgT7lYaM54ufGr1yzy2wkzV7d"
+        "XuOTRqnVor1+yw3wwoxvqDKSWUVwymBIeLxGIwAd/uu/2bfTPn3dfYOWny+nA/A/r93T1/037Pn0dQ+lL/fBgLa20BBY3piS"
+        "F85djSzQVR6u2gGEpBBd/Pxv/qfrxIyL1t/yFGECgPzR3eE8lwtO9CL4TBws7Fu6//B9o+GmB5s3rBgb2/n57/53UNfSz3/3"
+        "f4JKS6NsDEGUTU0zaQvateBLGhjwGwD4luJWzBeGIQDpYvixxCPuAiX5xpSDeU7BpLlppVFFOdPNhMrhD+wF3kqn2pO2275J"
+        "v25PRyfzZpLN/c1M0+aBYhAOZU1o0prsG8zxHDJ1pxgd61HgpX8kmesW8bcrG4l8lu18hkNry2JQg0csmsQa5SLw4ikKSb+y"
+        "e+XrFg42gtY81HG0lboPcFi8orI2zepjV9nA3M7RL66teXtdhawe0QMuxzg3AbbEkZG0iR+ZadYShHx63ToSWnXrOJ4vccRr"
+        "9Duj5CThMmLCEG28Vx7GgAKyn1wRPMf4cjE7PcqbQkG+h0yTHkYZ1gUjzY2wClIE81pBBqAGiEi5m3B5xNZDl9FspU3O3MS5"
+        "J/f0y9rxSXzd1NzVVCMPjxJtrDE+DdKIklurcqxyqMfih6zbNOgHqjGHFhcW/dfvL9qryzftAJ70uYwMLI+vV+1JNIgnbb7k"
+        "94vjKZTqK/l3PnuG404z+aNIdu1ASrr1/hrznIdjkjccadrBy1ekzQ/w8BgP/W04/D56iafdAkWonMQbnANwtBS+ZthGw7gb"
+        "0VmF1LY5F8cVYSXQkuKUoezE7KezkzJ3tGfmrzGtOW39jWR64niVDBusah7KkzQqYLJMisOyQiua9Hoi6DhL/OVL+KXhyDoP"
+        "VNYtii15dggaJ45RQKU0mk+bRByDmfd3W/aA0w4ecOEhWtuFG6URKYGeTbTJH9CgjAvqePDyH8i7iyPY3R84C4wKbm6zE4ga"
+        "nwV9u2e1FOZRFugbRoQAWN5Rhvjk/Q+X+Ofry3etTTVUYGgHP3glaGc/VD0Hp9zY98Z8QWBxUNNo0WwuBO8XodWJmTJdRwqT"
+        "WRPnnIsMmHXR8wmkvvVrCbJyIeSBDPWNfgaGvyJPJB2AOITlIotcgExDzYtFkJ8z6CixLcVeDY4Zy0bJwuBRcC+bHyPCQPZZ"
+        "E4x1wSNUCgrcAvJPVpRW41lme8pdT1iDJA+SDG1G2XyGWIoVUBkGLjg2oFR6nvD0KyUWlH9G9Ldk9Xh0EqNVrBic44Wtht40"
+        "R1Ee/VgHw5WBBhFwMq9AUGoBiOOkAkT9oDW9Y1zKQxwBqae3u2lIKLRE2eE3PZljO7HrSsvjxL6/9MYOFeqsXAqcjU04yWmc"
+        "tCCRQT7ADujFnYfXjkwHFvz1X7M7SmcYX0c7Yju79stnBxzhb7wvHz4ZQnhFHGWFFdFynBT7jl9AxVc9doAfnQOqTlHsNwfq"
+        "1lfAAwpSLmUTHzsoaqaO6AGtxs+2pjx7VX9fiFokoSCH3B/o94LiaRfMAxJYB78oIfCbPLOH5g947uMB9UobSIciTYJOo0VW"
+        "aq7M0LaKYUorX+MZxfDPY9OKUr33we/baOpSqJdtmoZvJcdqCf/KGMKFMicjBoiMuMN5dmkQpubhom/f8KHXUPWb0BlQduxF"
+        "acC660tJea1BEo3acw6+zuk0nK/4vRv2+6TxV7bb+4B22ahHEy3rAFsD7qIGuUNbANNqGVjVY/l7MzIjZg/AbgFKwXYAqh2A"
+        "XYngLViO5dkvlV/hy49NrfUFcWnPVPiCSLaneF2qMZS29FRAHR41xw3KYp4iuSE1izK0P3tlxBwtUr2vt2/YfsrwIEaU+Dym"
+        "3VBk6CoG/KAYsVI0WBWn2GEB48BQA2HfrUoXZEjSBQ7HultAXlYeJIDGO8Fe4MCEEr1tvJAP7E+8AxtyliYDR8cQ0G3xxs//"
+        "7j/KIca2hxf/2Z5qUNqOygzVpwCjEiVHDIwKggkb+VZaeCZN/L5JJulOfz0VrzmUH5sk/d6XVsjjeFMOVEVHA4il6Et27eM6"
+        "tKQ2QmA0UkH73befvEevefbaEyE6Qe9NeRyUD9j2pSve3VTiX76z2oh3y3TS/KtP3mPXX7bebdooxYic6qAxmW1UYhTN6IxR"
+        "I1foVmdQ15mqgBQPgSW/b7I6JoKugSg/6s8VfuK4sO20KlcO4OJYxBFKyxRH9Fhb13cFPQU1vxaUvKSwXUC1Hk5+ddL2UhMg"
+        "Ter2OBuOlXKhVsM0bOZYHvZKh70yw242zwQnzzyVRhnOA55mVscWRKVv1Hk4WF43+IIRQ0tiZtKSqThW3MPGdYvBxey26mdY"
+        "2bT+Qu37JjwcVQUamIWdFqQ42LPguArjWJz6XEwc+B0bKxEt/WZUXkqvhDvuKtGS7XdZgg1thtKWj3qmNdcOsG3HYZtvl76F"
+        "Lo/hDq5vD/oy5DbHUTDw0M5R/u7LKx0o/lXrhH8ooamrGZ/5JpO7qFI+ZljxXBR07B+y82Oe/3HmOZSTy3f41iwBZ0rEic/M"
+        "yeb3ACTrh+LE7GSwQSw7HFxiQDr6jQYzrbQA9zwY6pNoOPYoq9W6jZwmglInZ6kUFh1Nab3nTFDmM7QsPvssPoK92nSZiDGx"
+        "NOKFoTUs8aYCz8qZ6YLyRNFna39zyX6lpGsXy1EpO7yoa7Wm3MqUU85RXXs11NHkZkyZTYuNXotXlHGIMA9VN4BjknlqEjaF"
+        "Ec6pJOLoLG5ejUN1w4N58OqxlQtcNTBRXtiB6VG/antsmNBSUX22BfM9xcCm0ix289ICCRSXvzcov1zcovCQYW+TUgVCo/Fd"
+        "TE+KFwO4/8BPtwG/YRw+oZo4b4kqrfy5STVEK5zrzyZ7NJq7v11icR/ZuL6nDCTUwp5iTxzPoLWrKLRG8TBdLWiBkvMvj6Qk"
+        "eXGta8Bgd7tQwn2PmT14xGir8DiFMiXK5wN8gmymSvah6OcOYTwUHR3GEmWr2dDTqmjXdLmCaR2IQydtXy9r5KboPMJRXcrO"
+        "GdQAV/1QHSZ+G6+aDcyTIj3ARWPlk9mQvsNQ7cTy1HQNgzi/fPzbL59yW4sRuQ2dPIrCVQTtNN54aiVEY27o15VvvpdkCnte"
+        "oxmcCvcII84o5C/0CeeaVFYlE98hhq2kUAVEYsw6+vpRp7+z645WnDBZkWn50ZOjzleHzwRtKECBnezskmF6w5fhlQYPv5Jk"
+        "tnH4CvKaLhAu5caegKugG4Ch7d4N85Ld918cvXiOAGikDWla0H8ZW9CPYgU9R8Jal9WlP47hl/FkdgaZfWHJj2VVmRu7lMKh"
+        "DTjJ1Qx/girni/yAknehnxfWDUYTi6GtI94rVnEoxxJokjS3hRyXtrvbLceJiF0c/RMoerBZYQxHV6RnIHVzYcX2HXyDxrSx"
+        "xKpEUL0MWp6fbmyNniXltuRNpSWjRGc0l5022+UL5coyIbKRZiOJ3mIlGhqmv2ExzKe1fU4Q1G9qsdjz5KGnYjhn0WpI8z16"
+        "UkM8Z3WEEQDYOJdrmLvBwcEyW7kflA2PYtYwRjMd/IkZfBaTGVCwhU7DueJIogjPdQKljd/E49U3YCL8ThZSxaHJPBq53U0s"
+        "+NtlAsHkktO5VJQ6Cjm8QF1RVLCQQi2Ngn2Mjwpk8SVysg2ArBxLXYzws4ySBeLuowsDkcC4pjgtk7oexVUlQgYGIPqYEmi4"
+        "rqXTtMWagwIHCbi7Ur3lcMjU0CF6aKDFysMTIHin4KNw5OZVT4u1tEEyW/0S/AHueBOCxgHYTX0N8ajWzjZZRLxlcNtocCUy"
+        "qCNAw4iJg1Yw8ISOfH5yMoFAxGh3IK+OTp3fXZdDQA7s0fgC+qQHmE/uRm2Y2lxg/xdOBhqk3opyTmBWJewQ96bhuzBC5D8K"
+        "pSEsHKwOUCXQp5HaBN1e8xnE6iHiktRbj8bIUcvS/zGHHs3844jxemqoJ0qDKlXsRk13gybEHpyruoMkWzwWMGxrDfKphDPr"
+        "yEhsh9MoKXXYwAlFmrIQciXhulkqSDfONSNO4ygWOGfSRo0licoqp0lEE01Haxqv7IO+abX1O2mQfIa+LpYe5Y39bCCD14/c"
+        "k3lni9Dbha8fm7/y2360Djj8cOQ9u/etlvIwh0L+Ajg3R+4mLA7+hNo7lOPAs2ZUNoxGYZR7NmToEY9CSzZb2gDR56635mX8"
+        "NQk3SkyT+xgd1621t1wmUwe02Y0rEK7BRB6yeM2CeADNXugjxJzx/JzioiDd9wuQJtAzUZTRtD7C3GYSuzV6i5kW2HPFDnKo"
+        "oUk2xMBoKAs6lowYRqHXFoW1owJryPed++D2mSnrNkdBQnRVC8iSUgkK1sGWR34SJpElMnFxtED2ZK/ZC2CmFCOKGr2XtUzS"
+        "mZcgdPb8PMSS27eo9e6T93yHotbT5XvxAGl8yXMPdHmfvHfHZi3o+7pcBurnrI1cqr1rhJ9q9ZYa3FvcRQ37AOy+fKeOQJC1"
+        "vbHoTL7gmOTxsmhIftsGYEIrGoPFLEaDIjW01bXZjGIV5+84k+fzwBTFG885QbKBkCmGplMmEoN3/SV18XZG108FVnu0A/cP"
+        "Sq5ggfAKJqqiIpQcPJWenbzFDkHBGCJj+M4PBnD/wzB/YDIbWgC5A2kHhNCPRecJSWfNTZAFyNIDY2IshkzI3PysRIqUJZTp"
+        "nVmNj9u3tVTRbEp+GvdKX0xeFv1q1kfbWJTKEYKqTcNDy9g1RJUS4nwI1YzBxrIZ+zhJBa8dfbKlqfT0CVVJ3SJW99eiN9QG"
+        "OupI0qWfwUpsB7IlyQ5yNeS/gTwzg0xUDEfU7rHq3KUpN4a41LO0CHFoieRo1OO1KpZnzQ1T67VgPhZ0AstIMoG4OZzDBFpg"
+        "Ojlsz/C7hnVaot6DHN2GwZfAnSAapkzvwYW1HhDwFooFexQTwrKqf3Q84VhMx741Xks5dDAl2p5TiJUTF6QvPOz1uuoMshdU"
+        "yIKafPaMfUh9Rfa4IGXYE+zqK7JnjYtwqWuuWkWR+tk3LH9WFQ1qGw2e2y9ErMS6ZysXXJsx6SDAYf3prGC8rrZL3hRROfXt"
+        "LMJYyYI4jomO7XKP2zoEroDMxympAyfHN4vZBDu8qbueL2TLk9/LbG3BFUhf4FDUDsFwRmNPuFTC+L68eDWoJglaDEaJh4NA"
+        "FFIhrFSsBanc0OcV3J7MtjHE0SJSyyl5jSL2VFmOCQoVOZA+gcCAr2OoF8Y8ni9X4InwcsBaiZ9WqbT6CqL8Dwhh9gsvIgSJ"
+        "jBpKknO6xQKII0eUSzOdlCYqGUh8AcKTKeVn7n41fgBRpCjQMERv5D4ZQu/5ozUNxYexWxmjOoeqR6iOE+yEA/SEiiv6fiTU"
+        "39BrfwBuKtxaPlPg4plxVdjFB3Qv7JOef2tTNw5HwkVbN2yMc0EYhC5t7WTUmMMpAGtalv4borQSNIJkY0UPvIGoOVpBrcI8"
+        "oyK54qWRXN+K/C12M76aACR8VplGpVr1frhgm61WmaUIzq5CaWN/bd+sMy0RSAuTkZeJhAF73mHh3ZcYFJdTlJUaXwCKUB61"
+        "JyVUvgCOxP2G+UtxoY3CnqwkP0hn9L3KH75EoZQjNwSGHJ8ERYhI4zJ8V8SQGGt+KnBXFZwFPV4C2MO0BHr8rIJeXl0Fem22"
+        "DvrD9KNAv1uG/qH0VwC+MmYP8JUvf0nAq8BjDmBlgceHw7hfAgR8YZV0fwtiRUcPd3yUJ+oWilbVSxBs9n7LO6oaKG0Q7eoB"
+        "3FcA3/B0xAh6EP1GnQ7BHXhlFjhLBiQX9uVabNNZ+eDD7BTfMfCa/myeKlZPPhqTTUGFQp+w6kkSLpbZmJCcJI5MvTtilgt1"
+        "vYM+CJEGQBcgxQV4rfruwVtymZI1i8cOhZe2kc07qRR5y3dv8QKJC8Cx7cpe319KiQxyt+lOnQS9Dg0/tu+1U2yT6DR+q98+"
+        "pNeRROuZU5myMbSZIm8NSNRbmRBDI5STXf4qoJ0koBMkM8oS0cQR0sgFUUCx7iadD1bo00nLAC5evh3Qcabxqtff63bx/42P"
+        "4K2PE2Uusu9EtwUkqpSeAG/H88noLX3BvU1f+QI0NMoc/mp4YFVfofgCINfAXvhZ1c+2IbOF6ARDdGpAPpnPTzORVAfzJRM8"
+        "+cDD1rDlhLBkxiuIIO93O6SskRELtFqKjIpgJupMlORWBiuUKMuJG80kqegL0FzNrhFmy21j6Pj7SzvphSXZJYI9tNtMPxZV"
+        "6odR0JlfuPO4Hte3dut9Rd4jP96mnEov3LmUI4UeogDv0ys6PpQcNGhPMDyfNj0kF4QZrPz4CwjnsLZypLM4oVsv/XmREYqI"
+        "inEILjLIQDyS7192+IxlnCb5FWN4MQseQ79NN2RzpH/yfduc+nngGMKie7n1/dGXh0S24s2T77/bD/D6FZXaqahCIP8BP89A"
+        "DsjpuSaQ/Tf23Hi5zG0A0cL5RiswOZSIDtPBi8MXgQSda4Q61fdIODpdGWIPs8PM6CtMOEUmu1faMxhGg3gGPMny4sxxBbJ9"
+        "TFT7iIhGEfOmiPbnQTPoCIxAGhfLPWYKF5KnGZdnwwhusNSyxpm6osuJcUC/ovQGS62LelmiU6pg0JNy2/NttfFPDFuh7UPo"
+        "EMtmbx35ar3Wem8sHbtryuOrPtUEOazrpzQbtqQf8I/J5H+qWqEHrkq/9rwsk5cAAZpHl6JqDhtr4R9mEKJPeg3cGL7xlEqG"
+        "+6peyvmsanXm0TaTpnytcQstpOHhcdSK2Tp5DWiXR7olLkm0WR3CO/4QST2+4al0nDKn99ApcyRiRldB43n2Sk3pJv3CxVSp"
+        "76L8AoNvi+MpcJa/Mb2pU/CoqyB2z5kMsFDymBnQaVXgDe/+nY5iDHFoBBamBnMPZ6TgOta09QiaXos+f17UgRZZMWec0Iy6"
+        "UtzBDw2+5DH9OjwhLrVVSnhTp4Pk96pAVVZJSt06hHqN0I4qUknKAIWP6nz09Zu/LLLdHlPEkZcY57nx2kBAizS+bUrsr+I3"
+        "kjKWZ8QsPu9l6Y/0DAvPF37HqdW8QD6POJc69JWgss18oAeZvrVNNSumXDHYCPmtt9hUbTQbdPGbDoOiwjHkvdGutZVJPlwp"
+        "bQTskuGn1Sok3rvlL7fTKEJFN6acKi0EapwQZR7QHivRUelko7HC0lOxVQhRpUDs017LgjT9FncTzxTo0kkIvh7UBNVNFLzL"
+        "sn6QKX0bzj/TC6tY0JSjUKj6RKi/VWMu/v2L0FKcJDPmtArulGMmJBHwgeOwnqUZHzwFxk2tkHCscAYDm4CVZn1dYB1Ta+0Q"
+        "7qO+vqGJiEHC3gBq9QNM/rvJWE4vLfm2KPiCCpyg/QWgvK91WIqsI4pHWqrRksrktNeUH1n5xlSZqi1YUrLsXV0V1ahRdtrS"
+        "KwAA3zQzRx3Su29mPHgaSZDpUFZvDTmy4qB8rghuUq5kXKeeibahG4p5VWvgHg0OkGqxQ2L/pGtf0UeADw37IBZIeyy9cgIS"
+        "si6HBzlFvytDqc6SRWlyE5YwE7JIBVRoL0Kry5bwRfv7N4EaQ/ij3gRZ8Fc1j1DXVh6X2s+ZQoNTlr+tVmU3mkhQtUVVJm+N"
+        "To8VRLLZN0CIwzBNWJHfmaxUTHa1y0cFx/dO1K+FEYp7moqoaFIPKoWJEkK4a84/xLjGjJ3Nb+yN761lqILQIkvSZW0d9L6o"
+        "A7nmOBaYOyG92NUipq/tns2iUVXJuNfVxG/S/rvn0IMYjCRTryBkKGG65hoKsW3LydZSlYZqgbC+SG2iR+r5sVhlRGL/+U//"
+        "JYN/QiFWaoAvTz++lqR1p9haV0PDEz8/Jjw+DBIjjErDh8mDvan5etNiHyxdgiViQynuzLH75aSw9d1EL33oGQpvI4yIs0o4"
+        "qwgiKoJ+mChSHomRG5LUmZChYKHFnMdhSgIoSqnjI4oRQxUjdA4bBImhBgqGTp4dKsFnPuJ/FiqcUDEsNvjQChVDt92Gtxcq"
+        "hrcXKoZ/ZqHCDom+A3qQdlLAsJAZjEVqWvuxpAoSbVeloKLW9bLElQPQlmuKmNZbH1VKGFakhKEvJQxvLCUMby0lbOKWV/KD"
+        "O2v0/ipOZ8QL6IALDP6NcUgfGtmN1pGXCGuD/h+j3S5Cer2NoCXdF2vcvFL6s2LfsCzUDK3Yh0yjI78QF7dcxtMPgxiFmsBC"
+        "91QNq6tn+tZ0y6w5TduGzDGUTedbEgK3RcwO9HhvQQxUnhveRJ6rnboTvspzdiIYwVLUX4OKFcQE3za4QUEk+1AuvMkwKifq"
+        "31JDI2EVno7B+s3xPS5XgztZs/EHUq1eC55zvl/jmaSK2zp69d2L519thTSkNaW2OG/rNQmcxNazF18++e7RqydrZexlCFLq"
+        "hyePfrtWghcUqIes9TWdMrVZg3n3XfqorX/1h+zXzT8s3/eefvqkf/lH89S7/OPPf/8/WlvLUqNQT8nQW9qSToOJeaQr5zDK"
+        "dqUGssgNJ0tqYhrS7s797UtmEtVxUFC6utLP//Bvi+Kw/19T+h//Q1GagsA1xf/r3xXFmRjzmuJ//9+K4rxdoFx8Sya4ffjQ"
+        "gHD78MFlGXq2rnHXKbBBr5k5UOzBtpR7CbEwr//VHxbvv73EP88v3/xma9kOTAYBg5ZIhg7vLalNMZh3elYQr+USXpkMBPIO"
+        "0gWSHDHU5rKUheoUaZ/XUFq9KF+/YQ/EWEYrZXt/2PrDFoaXtTCuE4tdJrwfSsapxD6OGTDYbE7F8xHbNx5q6843hR59YuDV"
+        "YctQ2QgaAOBHsQuvdQVB7iLNHQWxH9m4sKts7h/g+dsBLhJUvaYmWKQoB0kPmYSYRChlLCVdoejFWiwsxOnwZA52JP7sot2D"
+        "qH/05JARj4luQ1axgzHTNEMEdZL2CqduEo5NMysZklGotASFVwnFXJDwIcbvr8UNhGI+F0HWkQuy9kRrImFBwiLxqWy1jZD8"
+        "LtqDXzU7vsQDwxL4N7l8d52IfDsB+Z9cPK4TKLE9cdcG+c1pyJ1VmzPTS0xzaxFbtqp8PNW7pa6T3Ky4yhAKCRHBI64dyq8R"
+        "prWMuHpOcUN3Ir6ejHJBQ2ksHAMFmPm5KUVblvv7IttVAtsHiWvrsgoTmKtzuiE+pyHJmHCU57RIg+Ro/SxstFzvNUz80t9X"
+        "y3KOZtoDisCcj24PeGTdqbyjdMXT7Mb6fGvDpaUqeOzccsVBiERpIGsoentV2/PldM5AOD6u5IB9TI8jCX2OrUhiD9rCrdxo"
+        "1r3YJEZq0iis0xvVKNe7ZwaNp8iRgfKaTEMP/yrY0FYuE8vHMFbDIYPeOHNJ7vaK976dsLjEyFO1IhcbS2X6BRjnIDujIkwK"
+        "q1iE/+5XAmQlxtRpQLzYKh9vVMyrBCoKyDfEKdpNlIzKcYrNphf2xQZa9UZkE8WXjFouu+wAW3Wgd/qJ4BZclrr7UnYDAxwL"
+        "RDYeeOQXkssN8d/JQuLZeMeZCXTIU03BAulYvs3TAf+cnetPvEX6Tu5zqSRP9tuQzXkMcxAmI4fsAzsJSJUZFjWVeNTirbiQ"
+        "Nza6cj2anDN36HwWehuoqE2Rf2Nl54RY8hojqTsq/AgrDiLWC89zscDRXL1/BMd46zmOdOou4vuTsShhqBfIFWgY7P3C/lSz"
+        "eH1XWvz4uB5SFs4mXLneTRBZn0LZeJ7Zwrwhuhh60/Ce5fSKyAs4KnVMNABVIqbSW0jNJyfxCLG/+kAXFfrYrJil0b5jUfrG"
+        "iNw7Cg4fff/qmxfPZZozE/fFz0aLI0q9JLdugVfOJVqOwAFG60Ft7lN9OJj5CG6Io2KWmxQXoq+mx9HEaHN1plJ4babXjU9j"
+        "xeCiA8UnPAnNNGFyAsUbMf8DSH02D86jFLENLIbldDkw5QWFohEBcwxi7ziACeOQYhYTrgrvrGO/NaqBB4ZmD3Bhu4gZa06O"
+        "7kxcP9/KnlXV2sCwlfvdEsLZl209AhoEb5R/ykIZVzuRuO93xb0gfKdas+vblkc/7HdDe5XtdNcjPEX+mwFjT65AxVkdEm6I"
+        "RjSYvld2EUZ5E+gyKOJc4B18VezioBq6KEOh24xoQkBZIslmms/nyFFwbvXz0H39tGRKUyNTqGeMus07vBZZYQNyQ1IZljT+"
+        "Bj/RlWuu7H0/4G22CIzU+CP6xm/cOPOUrryzdXckc6L0tgH6U+cHHneMp8OYHpGB2usi6z1HYhMp7c3N2NXTr0xNvTE6/fV1"
+        "w7RuoWvDVWuukDlx+gu+yTXAihOJWTEXpaJscXWruM08hIf4wyf734ijrxChCB+PIZ08hKyJ9rABfiLrjmMX1ZBgOsHPf/oH"
+        "rqES+csNZX/+0z8ax9UUSV4mMZJmTrn0djf9ZQhSRcjnCed6Eb+tIh1DcORBJDNmGfeC6t7K1ZTO51pbY5jtpsA7snBcgFCg"
+        "5Vgj8a6IvVur4tR1xdtZTRBeKTJ642Ce6esfmG4E4jbUMyrSkLHLtJHJ4zRs3FErxBVDrDQ0dlGCpeaA3Cr+2RMMEdWn5lAv"
+        "4Jq+dDmbifuQ6Vd6MEGPnCYL2IDIvAQfddz/MwVP3yxwWnfZNIF+bdX6WLGQR3/9Uu5pbx69/LG1HhUIxbfp8GYhgb+DE+aS"
+        "UQ2lsIbNcY5o/CzrM6CS5nVwFPfiZv19S066LXcvZFf2Mhyf9Eu96Iub9YKriHhXsTG5Z8wzsQ6qxv/9X5IigvCSTBSVa0R6"
+        "JmjU6hGsY8oJaUHlkiUcLOITpisxDquh3hgIB9GZuoXOVEz4/qjhZZQ6+ZDYshfiOq5YnjXKUezTWxrBX0PgSN9onuITL0/x"
+        "dOINZINirtZwqKqs65RmAvY01FxSPiGSG3OFpOkduFy0j65Uc3br2QbTpNGhNZ4xAZrqbBvGpJla7Kc170z3jkYFVfbP1cO7"
+        "zsC6EUACm0BNdrI56gp9XbASCdgWDK43XU0nlVjTcoyv0VDMRelDPQUxaU0/fFvXiwERTluqdbsYiNsFpYn/X90sNm4KKzp9"
+        "2Eb48K2gGqSr94ORrH6p80Bpnmv4bD+80Nm/kKlf66ThnAkG6ooVUeFNHbj7TYX1mvaDHT3XMzUzNInEZLLLFHrVxkfxS/BV"
+        "cTcxLnua6SC43BRvvzlinkeAAxN3v39j3uJFxjvOcmO55Tqm/I1qcG1OrtpsBpVYew/0V7dt3cmubDwPZzdu8Jk7RG9q1KUY"
+        "KmUYYjT6u9o8D9fKLJJUZK2zsmCkoetcK+2+CGev9PnL5AJRJ9M/bmXk/LU7DHDeIT9AgeLk0ypufPPShydy1wHLA3W9+7D0"
+        "0iuk/MEnWKqgg+g96FZuPtCLfA5wsS2qf7GeYwSTvisdfGFRgK/YoMcVK8lLvJQl3KYuYctfQuaRsQIMxQjvlkb4F5Z/hOTf"
+        "zKCoC9A0wH53aBYBFl9Q2eJiM11KDZWjJP3N0Quz+cQ3ToUpVUWxLGT6txLIcYljH3UiokTHC9HZyVlh+CE9vZPtYAe5SQv0"
+        "UaS065Z0jcOZeySukci8N0b8asqx2Z4rBiJfrCvJ6qj2h9jkrOfXOy82lfdB1yit1nROpaDaajRtW1VSaVyoP1Fant+i5UsX"
+        "gzqIj+dpadnMkT54NJkEo2JY0IpD403laFRoVdvys5oB5ANzq2xOjaJsVnOstA1RxK+yNuiGvtlGf/hPwXYrmVb+me1+HLZb"
+        "8D7SquvYH69cXF/7epbdDn4Jk7odi/qlB/QPZU8No+9uXE2lPQ4Vitz/rsRftsdqxjHxJu0PZCg+P4ETI2KFezuWVNXh2i/m"
+        "Ilee+p3Qg5OK5nTe21D1MJpMGU2hGUqkoadqO3CSUMtjRrdmOtbq8dH5znMsjHG7tnnpoMobxPk5XTdMYg4sqHN/bHQkqJ3c"
+        "RXKHwjgLVsAobtocNBnjE5dvsd5aUso7soFzBZWkIH4+EOVNZtgfgz1NVO9SuwrW9GjcQ4k+dmnuWnlg7aVdr/0bRgyJE9hN"
+        "A4XEl7Acs+xpiCxKiean1P9y0v5z+A6J2SKnRdM6TthEgkh6AR8oNUJmCVzeJPmwNXayxrH6GMXOvEaf+8JlSpBxGkfUGxxj"
+        "dmqB4F2vppVKCqCzulT6JjG0cWzIk2PorCXndW1+fezt2SiamJueVakcnSUnuC9DlIDu44GmaJeLn/QWEBziYIx5Fo+SiAhR"
+        "/Go2mqME3r+I/aZ3+J7XCWwLWi3O3L230Gw9XuWao+F08+Udp4VLcmcLdAYXbbeKV2/l1ZZkem4cNPghRj7X5jZvKjy1yQF+"
+        "FWxDbyb/3vwmEHihrniDhOeTrKn3NTl9AS6o7RaDeZSOwvMUbLOos1/KUo84M5N+/y1a865ZiPQ4zSrAhqhkk1wgvo+j2Tum"
+        "FWHf3CcoQYNoHldQnEWTZWx8/veLFPX0bXR2qkiLwiDmrlWiw/T8tMiRrzOTN64NukwfzqfAQ+S4JzSY4L48CTZrLvwpZjs/"
+        "rblcg1bhIzKUTTnCNROHwxgqOp2jOX3L6eGVq2bOFaf3dHoGXxSaw81VNW5dxOsNRV6i52fRDIr08l02+vW5t1X8z9XeYRlc"
+        "Lni9C0/7l56zJScmbelj6FIrVVuYIVXOyqvr9xziBq9pkjHuxxy/4lki/LnchnmtjRT3Qzhjkrs6wdvMPoQYdTNa+VIlBB7v"
+        "jo8TmYOBFkPHjpYDXH2WLDjIpud+y2rY/FfOAVb5mYALBcsXS7ATAqMlBQ3gqIivTFfU6OzqUuM0K/unUpgOApc1qMdCL2ZN"
+        "EMXY28Z+6mgM3AGhNCVzi9FLNzMfBlLtrj9T+mGymzJa0bZu826RD8B9K/gRLlaSKkkYAzjBVNIkpdZHKHk5Jvk9clR9AcmC"
+        "ifLS0gDBGdpCXVrVhMYfhBKkCr8MITatM8FEj8lipS0dRcWQm0uaHQgd0SHIbdlmNkoclhBWrhpe0ch7qhfS30FMxUZ8Afaq"
+        "AfJtwnFiYHck91fh1qQ9x4qa5SG6K/JKzrx2Uu3yhPbN9SU/LTPc96RZVO0dL2q5KeFwXODK4Xw5EZ4dKPmcVfh3U4R6kehj"
+        "9c39wj7Qg5sX+yj/a4WBZhEjBgnGSLIfevvR1bBw4/ua8srREM74s7Zx+FxpGQ+fLtd3kma8IUGFKH/hE/KFWxSP0HtXEMxz"
+        "ETQg+GC8pYv3piLMXYTYaOnqSFgULyoKp9mJvVBlSlhNK9m3we2messKnaAlsinT4w96EPcz/DU3NMjlfBwNO6q7jNzegrMq"
+        "bhJj0fLpw6gMCmcM5mVw3sfCm1psowk1QHCi/jPFMraNpwkyCKmrGhp3TkzeggBTcd+9xACNRe4UcyLpwlEE0T/hmXPORX40"
+        "kgvCS2uZ07NrboOI2INbc55NaW0yOahc5FgxCZ/F2YlwoAshRaBWOATJtY0xz4vn8aA8QSVqs5huoy+Ogt5uuM2zIgMB0rBw"
+        "0zK2MHHIoReQ5vPZMCTlmWYwZZoK2NgBgX5x10juOtnUGsEgJ2yD+oVTj5e2rS1p7QaMMTv2EtZtHo7jyvXjCQY8IhonYrvG"
+        "YeCCumqJOlf7eRlR7AKboAg5KAqfKMN74zBFlbIRgRtf8TapwtNPjq5+y21NLSheghaNMBeToKFR9Zl57ycDzm6XO3g9b3CJ"
+        "WUtGvjqaaFUEa4kb7K1mIpWRGsj1U5mcKBnisyCTgD6Gr5tWzbAJUmVi/gXjBaZzuah1huP/ISRivYRhPpvF9szAC1RlA1qE"
+        "l5urcvH3xPHG7HccJsXdG0eQvG281XhdR67u+PSA5BGHWekkNRZ0CnFWJiihzZNfwUFeZGfRT3ZuSPQiPbL3KU6/2Dh2fyiB"
+        "N1jLHK5STdnVv6V3RAULlOOYEynZY9NcGWhPYxxmS4IlMYmEshRTp3gwXocwX9rlULAVLJfthgGi7jM9OlMVo1nKSCc0Uy99"
+        "dgkwOryaew4VNwWMFRBWFIxRFUYmXbZGkDbyk72tLU8bYQ7QeydpMtqXM26Hmthsbxjzys59udiYNxnq/Y17vM7GSwxnZ1kZ"
+        "xIcl8vaXwkprun+q8prIR8iZVxb69tekIXPYrIgRwp3dTift8tHsJql0eC+chqvsyb8d+imU8utUt7Igu8gGTke2TgW8biFa"
+        "bLyvpcYX2JL4en9gtRKZDOb1dzZhMDeLC6zuwiH0EM7vtO/7zJfIJ92QL6xSqbwaVV1eWtHlLUQdf5u+JR0RNyGEco99VIwR"
+        "Ao+yXaGUltdGOe2pZy9YXlSE70iUXiXneSl3u4to2Jxk+aUfPGV6kawY5Uzq5ezsRaTEcrG56Vd+IFYxAZeu+Jdma7+iZ+es"
+        "b2dk7uP68KTpXmdpNfitEqbw5AJTKXli721Ok64KcUkpPAsk5UyHFyZrNNp6jhBNZk4PJj64myuqY/Bsznu+2EOVPeFIxCnC"
+        "41Rzj1Td2ugm7X1Lb9fKPLOzlL+N5fnd+oSMrl/mZO7I3TitQ98ucLuZmaZvOjmLMa6iZ64weddKKfnXZ1YeOszDy3z+VuKQ"
+        "aGHzok68QDwRSz8hnlod6FsYSi/NvURiQuPB3t3cZmPd0tg2Efq34tw8I1vZdAQ7HSKCZf2y2EkXXyX511BEQEbj2JjsV3Uz"
+        "lu6D4eDu0thEIpyRbwyE2j8aGhn/d/ZdaGXZj0x0X5nzx9Xh1DrHHzknuWUbdXCpMZcZ8DFnKpz0MEmVDcVUIXktRl7mVoGJ"
+        "vaBVRFjASmKmDWGgBMXTWFu1YKMzSaPDBim4MXsIEgWQisv3RRozQAJ6B5wGYg3N/qjHjqqkI5Y9uWqFDxwW9iy3i52TM8Zf"
+        "YYFZzqSZzBzFQctzMYzaux43RHFTXPheqiJ79gl9lJ9QQ1KIDclsYa+Sk8ey90aC1O7U2ehk3XgBXOwx2KUWTGRMNNGrYDte"
+        "ico1lY9wzPO+ivDJnR6n6x+pF01SBhFq3kk/3bQd7LoEReWMTK+inrniJjxUk3wMJdkon2kP64sNsRScrnK6kJVVEPvNYImN"
+        "mzefpJX5TBtwsm/suafjCreUB2O43h5HQFdKvmg+hMhe1vYx+8qaYkpfV3RPlNmBIz//6b83vLudDdFUgVsulJZ1V1PPWm6B"
+        "BZ3LKwWcutFXOFqskhNvedxGLq8buCyT9WpcnwK+1twJXfgSqCbmkXAQjHipmi3VhC0Q151gY1APTqkK9J5RolYLg2QMRikJ"
+        "YynPu16iznK3coU50YSvRS8qrxG3E8u158Z3wamLhmMTcw3rldESCQXzTnIVpajXdUOiWu1eCEbJSNuViDbTmhzAV+AN1XYK"
+        "J71L9TJZ8LZFrIbkBFYKg5vFa3WU8mFzJg8lP6WQM+uzZWLjbKqQEj+wgtrM6scib6cLV9W7wQETw/TAmB+9fPn25aOjox9e"
+        "fPelqP0M94ASdOUzEFj0k4k0MpqTgsueqxyX4DaDe0lbcm+3XnaNf/eNGS4ENYXt/NWcV1t1C9T281LoK0FtMRPgiGXtSMVm"
+        "J5WV45e9BluvawZilPK1+xdlu9utvyjncCmVkUubTQkTAFr67u5rNmW8g+Gef7dvMVJRjB6U5//jjRHDXCTOlpVh1cCRPbT2"
+        "67T7wqhKZ9bF+dqt8CA4Ri9/F1+x68yN5h7M6y6y9+nZ4pyYK7feFxykbN9bvyRetk31bndL6vxUYmSlLbEKltQSMuzyO73g"
+        "3tw5r/Ymi4TmDrV9GyoEP5BIcv17/Foz/1egmPHiTg8frzZRbzbKnTBRLQwh2Xn4EzZtKLBpGm2Mz3A3LZHdD4tzAqM8bN9W"
+        "eCu6slGE9FiZEZVqVr20gYMazsQB17KUlj+BPwdzsWavIvnA+liu5TPlUf4ijrM+nnqE9jsUQqzk2lFw5DiZaM4jMihMXCl9"
+        "ktfY+wKx+Tn/D1iqnlDeoZ8VE9k1G2c0qEIzka+GcipqtJ16UAKKbM2i3FHhQ3im1ljxaTCEZl8kRyzdNxwUxJfmL20OuS77"
+        "vPGZzepGBG1o8d/PttRu/Tme6B3Dv+N8Ovn8zv8DDlY2Bw=="
     ),
     "sw.js": (
         "eNqNVVFvGzcMfvev4O6h0BWJvO6ps+ENQRG0A4KhaBvkYSgKRcfzqZalm6Sza7j+76V4d4ntJtj8chJJkR/Jj/T0Jfzloqkw"
@@ -2253,19 +3957,22 @@ def app_files() -> dict:
 
 
 def export_app(cfg: dict, db: sqlite3.Connection, out_dir: str, password: str, force: bool = False,
-               history_fn=None, now: datetime | None = None) -> bool:
+               history_fn=None, now: datetime | None = None, day_history_fn=None, crypto_history_fn=None) -> bool:
     """Write the website (app + encrypted data) into out_dir if something worth publishing changed."""
     now = now or utc_now()
     opens = open_positions(db)
     sig = "|".join([str(db.execute("SELECT COALESCE(MAX(id), 0) FROM alerts_log").fetchone()[0]),
                     str(db.execute("SELECT COUNT(*) FROM positions WHERE status='closed'").fetchone()[0]),
                     ",".join(f"{p['id']}:{p['manual']}" for p in opens), meta_get(db, "market_state"),
-                    meta_get(db, "push_subs", "[]")])
+                    meta_get(db, "push_subs", "[]"),
+                    hashlib.sha1(b"".join(v for _, v in sorted(app_files().items()))).hexdigest()[:12]])   # a new app version publishes by itself
     last = meta_get(db, "app_published_at")
     age = (now - datetime.fromisoformat(last)).total_seconds() if last else None
-    if not (force or sig != meta_get(db, "app_sig") or age is None or (opens and age >= 1800) or age >= 43200):
+    day_trading = any(p.get("kind") in ("day", "crypto") for p in opens)
+    if not (force or sig != meta_get(db, "app_sig") or age is None or (day_trading and age >= 600) or (opens and age >= 1800)
+            or age >= 43200):
         return False
-    data = build_app_data(cfg, db, now, history_fn)
+    data = build_app_data(cfg, db, now, history_fn, day_history_fn, crypto_history_fn)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "data.enc.json").write_text(json.dumps(encrypt_json(data, password)))
@@ -2324,7 +4031,9 @@ HELP = ("Send me:\n"
         "  sold ACME 27.10        (log a sale; the price is optional)\n"
         "  positions              (open positions and profits)\n"
         "  bots                   (which scanner bots are on)\n"
-        "  bot breakout off       (switch a bot off or on: dip, breakout, trend, gap)\n"
+        "  bot breakout off       (switch a bot off or on: dip, breakout, trend, gap, orb, vwap, gapgo, cbreak, cvwap, cdip)\n"
+        "  day                    (day trading: open day trades and today's results)\n"
+        "  crypto                 (crypto day trading: open crypto trades and today's results)\n"
         "  push <code>            (connect the iPhone app; the app shows you the code)\n"
         "  help                   (show this)")
 
@@ -2340,22 +4049,35 @@ def bots_command(db: sqlite3.Connection, cfg: dict, args: list[str]) -> str:
     off = set(json.loads(meta_get(db, "bots_off", "[]")))
     if len(args) == 2 and args[1].lower() in ("on", "off"):
         bot = args[0].lower().replace("-bot", "").replace("bot", "").strip() or args[0].lower()
-        if bot not in BOTS:
-            raise ValueError("Bots you can switch: " + ", ".join(BOTS) + ".   Example:  bot breakout off")
+        if bot not in BOTS and bot not in DAY_BOTS and bot not in CRYPTO_BOTS:
+            raise ValueError("Bots you can switch: " + ", ".join(list(BOTS) + list(DAY_BOTS) + list(CRYPTO_BOTS)) + ".   Example:  bot breakout off")
         if args[1].lower() == "off":
             off.add(bot)
         else:
             off.discard(bot)
         meta_set(db, "bots_off", json.dumps(sorted(off)))
-        if args[1].lower() == "on" and bot not in [x.lower() for x in cfg["scan_bots"]]:
-            return (f"{BOTS[bot][1]} is allowed again, but your SCAN_BOTS setting on GitHub doesn't include it, "
+        name = BOTS[bot][1] if bot in BOTS else DAY_BOTS[bot][0] if bot in DAY_BOTS else CRYPTO_BOTS[bot][0]
+        setting = ("scan_bots", "SCAN_BOTS") if bot in BOTS else ("day_bots", "DAY_BOTS") if bot in DAY_BOTS else ("crypto_bots", "CRYPTO_BOTS")
+        if args[1].lower() == "on" and bot not in [x.lower() for x in cfg[setting[0]]]:
+            return (f"{name} is allowed again, but your {setting[1]} setting on GitHub doesn't include it, "
                     f"so it stays off until you add it there.")
-        return f"{BOTS[bot][1]} is now {'off' if args[1].lower() == 'off' else 'on'}. It takes effect at the next daily scan."
+        return (f"{name} is now {'off' if args[1].lower() == 'off' else 'on'}. "
+                + ("It takes effect at the next daily scan." if bot in BOTS else "It takes effect at the next 15-minute candle."))
     on = enabled_bots(cfg, db)
     lines = ["Scanner bots (they run once a day after the US market closes):"]
     for b in BOTS:
         lines.append(f"  {BOTS[b][1]:14} {'on' if b in on else 'off'}")
-    lines.append("Switch one:  bot breakout off   or   bot breakout on")
+    on_day = enabled_day_bots(cfg, db)
+    lines.append("")
+    lines.append(f"Day-trading bots (15-minute candles while the market is open; {'on' if cfg['day_enabled'] else 'OFF'} for {', '.join(cfg['day_markets'])}):")
+    for b in DAY_BOTS:
+        lines.append(f"  {DAY_BOTS[b][0]:18} {'on' if b in on_day else 'off'}")
+    on_cr = enabled_crypto_bots(cfg, db)
+    lines.append("")
+    lines.append(f"Crypto bots (Binance 15-minute candles, day and night; {'on' if cfg['crypto_enabled'] else 'OFF'}):")
+    for b in CRYPTO_BOTS:
+        lines.append(f"  {CRYPTO_BOTS[b][0]:20} {'on' if b in on_cr else 'off'}")
+    lines.append("Switch one:  bot breakout off   or   bot orb on   or   bot cdip off")
     return "\n".join(lines)
 
 
@@ -2376,6 +4098,10 @@ def handle_command(text: str, db: sqlite3.Connection, cfg: dict) -> str:
             return positions_text(db)
         if cmd in ("bots", "bot"):
             return bots_command(db, cfg, args)
+        if cmd in ("day", "daytrades", "daytrading"):
+            return day_text(cfg, db)
+        if cmd in ("crypto", "coins"):
+            return crypto_text(cfg, db)
         if cmd == "push":
             add_push_sub(db, text.partition(" ")[2].strip())
             sent = push_all(db, "✅ Notifications are on\nYou'll get your alerts on this phone too.")
@@ -2478,6 +4204,14 @@ def cmd_cloud(cfg: dict) -> None:
         maybe_scan(cfg, db, notify)
     except Exception as e:
         log(f"scan failed: {e}")
+    try:
+        maybe_day(cfg, db, notify)
+    except Exception as e:
+        log(f"day trading failed: {type(e).__name__}: {e}")
+    try:
+        maybe_crypto(cfg, db, notify)
+    except Exception as e:
+        log(f"crypto trading failed: {type(e).__name__}: {e}")
     try:
         if open_positions(db):
             log(f"checked open positions, {check_positions(cfg, db, notify)} sell signal(s)")
@@ -2652,9 +4386,21 @@ def main(argv=None) -> None:
     bt.add_argument("--years", type=float, default=5, help="years of history to test (default 5)")
     bt.add_argument("--hold-days", type=int, nargs="+", default=[5, 10, 20, 90], help="max holding times to compare")
     bt.add_argument("--cost", type=float, default=0.10, help="trading cost per trade in percent (default 0.10)")
+    bt.add_argument("--stocks", type=int, default=100, help="how many stocks to test per market, biggest first (default 100)")
+    bt.add_argument("--market", default="US", help="US (default), UK, Germany, France, Netherlands, Switzerland, Canada, Australia, Japan, \"Hong Kong\", Romania, or all")
     bt.add_argument("--stop", type=float, help="stop-loss in percent (default: from config)")
     bt.add_argument("--target", type=float, help="profit target in percent (default: from config)")
     bt.add_argument("--trail", type=float, help="trailing stop in percent (default: from config)")
+    bd = sub.add_parser("backtest-day", help="replay the day-trading bots on the last ~2 months of 15-minute candles")
+    bd.add_argument("--stocks", type=int, default=60, help="how many stocks to test per market (default 60)")
+    bd.add_argument("--market", default="US", help="US (default), UK, Germany, France, Netherlands, Switzerland, Canada, or all")
+    bd.add_argument("--cost", type=float, default=0.10, help="trading cost per trade in percent (default 0.10)")
+    bd.add_argument("--delay", type=int, nargs="+", default=[1, 2], help="candles between the signal and your purchase (default 1 2)")
+    bc = sub.add_parser("backtest-crypto", help="replay the crypto bots on the last weeks of Binance 15-minute candles")
+    bc.add_argument("--coins", type=int, default=27, help="how many coins to test (default 27)")
+    bc.add_argument("--days", type=int, default=45, help="how many days of history (default 45)")
+    bc.add_argument("--cost", type=float, default=0.20, help="trading cost per round trip in percent (default 0.20)")
+    bc.add_argument("--delay", type=int, nargs="+", default=[1, 2], help="candles between the signal and your purchase (default 1 2)")
     args = ap.parse_args(argv)
 
     if args.cmd == "init":
@@ -2685,7 +4431,11 @@ def main(argv=None) -> None:
         for key, val in (("stop_loss_pct", args.stop), ("take_profit_pct", args.target), ("trailing_stop_pct", args.trail)):
             if val is not None:
                 cfg[key] = val / 100
-        cmd_backtest_scan(cfg, args.years, args.hold_days, args.cost)
+        cmd_backtest_scan(cfg, args.years, args.hold_days, args.cost, args.stocks, args.market)
+    elif args.cmd == "backtest-crypto":
+        cmd_backtest_crypto(load_config(strict=False), args.days, args.coins, args.cost, args.delay)
+    elif args.cmd == "backtest-day":
+        cmd_backtest_day(load_config(strict=False), args.stocks, args.market, args.cost, args.delay)
     else:
         cmd_run(load_config(strict=True), args.once)
 
