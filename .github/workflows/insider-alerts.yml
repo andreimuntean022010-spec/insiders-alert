@@ -1,5 +1,6 @@
-# Runs insider_alerts.py every 5 minutes on GitHub's servers (free for public repositories),
-# and publishes the iPhone app (encrypted data) to GitHub Pages whenever something changed.
+# Runs insider_alerts.py every 5 minutes on GitHub's servers (free for public repositories): insider alerts,
+# a daily scan, and day-trade ideas on 15-minute candles. It also publishes the iPhone app (encrypted data)
+# to GitHub Pages whenever something changed.
 # Save this file in your repository at:  .github/workflows/insider-alerts.yml
 name: insider-alerts
 
@@ -18,7 +19,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     outputs:
       changed: ${{ steps.export.outputs.changed }}
     steps:
@@ -55,7 +56,23 @@ jobs:
           IA_SCAN_TICKERS: ${{ vars.SCAN_TICKERS }}
           # Which scanner bots run: SCAN_BOTS = dip,breakout,trend,gap (default: all four). EXIT_SIGNALS = false turns off the extra sell signals.
           IA_SCAN_BOTS: ${{ vars.SCAN_BOTS }}
+          # Which countries the scanner covers (default: all). Example: SCAN_MARKETS = US,Germany,Japan
+          IA_SCAN_MARKETS: ${{ vars.SCAN_MARKETS }}
           IA_EXIT_SIGNALS: ${{ vars.EXIT_SIGNALS }}
+          # Day trading (15-minute candles while a market is open). DAY_ENABLED = false turns it off.
+          # DAY_MARKETS = US,Germany,UK (also France, Netherlands, Switzerland, Canada). DAY_BOTS = orb,vwap,gapgo
+          IA_DAY_ENABLED: ${{ vars.DAY_ENABLED }}
+          IA_DAY_MARKETS: ${{ vars.DAY_MARKETS }}
+          IA_DAY_BOTS: ${{ vars.DAY_BOTS }}
+          # Crypto day trading on Binance prices (24/7, 15-minute candles). CRYPTO_ENABLED = false turns it off.
+          # CRYPTO_COINS = BTC,ETH,SOL (default: about 27 large coins). CRYPTO_BOTS = cbreak,cvwap,cdip
+          # CRYPTO_HOURS = 7-23 (new ideas only between these hours of your time; 0-24 = all day and night)
+          IA_CRYPTO_ENABLED: ${{ vars.CRYPTO_ENABLED }}
+          IA_CRYPTO_COINS: ${{ vars.CRYPTO_COINS }}
+          IA_CRYPTO_BOTS: ${{ vars.CRYPTO_BOTS }}
+          IA_CRYPTO_HOURS: ${{ vars.CRYPTO_HOURS }}
+          IA_CRYPTO_MAX_HOLD_HOURS: ${{ vars.CRYPTO_MAX_HOLD_HOURS }}
+          IA_TIMEZONE: ${{ vars.TIMEZONE || 'Europe/Bucharest' }}
           IA_STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT }}
           IA_TAKE_PROFIT_PCT: ${{ vars.TAKE_PROFIT_PCT }}
           IA_TRAILING_STOP_PCT: ${{ vars.TRAILING_STOP_PCT }}
